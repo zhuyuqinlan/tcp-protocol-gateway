@@ -11,9 +11,12 @@
 // 原始透传到默认后端（已缓冲的字节会先冲刷给后端，零丢失）。
 // 未配置路由时不嗅探，无任何额外开销。
 //
-// 配置了 TLS 证书时，网关终止 TLS 并把解密后的明文处理/转发；
-// 未配置 TLS 时为纯透传（客户端的 TLS 握手字节原样到达后端，
-// 由后端自己处理 TLS）。
+// 配置了 TLS 证书时启用 TLS 按连接嗅探：客户端首字节为 TLS
+// handshake record（0x16 0x03 0x0[0-4]）时网关终止 TLS，之后的
+// 解密明文按上述规则处理/转发；非 TLS 连接（如 Minecraft 等原始
+// TCP 协议）不受影响，按原始字节透传。由此实现单端口同时服务
+// HTTPS 与原始 TCP。未配置 TLS 时为纯透传（客户端的 TLS 握手
+// 字节原样到达后端，由后端自己处理 TLS）。
 package gateway
 
 import (
@@ -44,10 +47,13 @@ func (s *Server) listenAndServe() error {
 			_ = ln.Close()
 			return fmt.Errorf("gateway: load tls cert: %w", cerr)
 		}
-		ln = tls.NewListener(ln, &tls.Config{ //nolint:gosec // MinVersion 显式设置
+		// 不在 Listener 层整体包装 TLS：每条连接进入处理流程后按
+		// 首字节嗅探是否 TLS 握手（detectTLS），使同一端口同时
+		// 服务 HTTPS 与原始 TCP（非 TLS 连接不受影响）。
+		s.tlsConfig = &tls.Config{ //nolint:gosec // MinVersion 显式设置
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
-		})
+		}
 	}
 	// 与 Shutdown 互斥：若关闭流程已开始，立即退出，避免监听器
 	// 注册前被跳过关闭导致 Accept 永久阻塞。
@@ -93,8 +99,9 @@ func (s *Server) listenAndServe() error {
 	}
 }
 
-// handleTCPConn 处理一条入站连接：嗅探命中 HTTP 路由则走 HTTP
-// 反向代理，否则原始透传到默认后端。
+// handleTCPConn 处理一条入站连接：配置了 TLS 证书时先按连接嗅探
+// 是否 TLS 握手（HTTPS 与原始 TCP 同端口共存）；之后嗅探命中 HTTP
+// 路由则走 HTTP 反向代理，否则原始透传到默认后端。
 // 单条连接的 panic 不允许击穿进程。
 func (s *Server) handleTCPConn(client net.Conn) {
 	defer func() {
@@ -108,16 +115,33 @@ func (s *Server) handleTCPConn(client net.Conn) {
 	s.trackConn(client, true)
 	defer s.trackConn(client, false)
 
-	// 未配置路由：纯透传，不嗅探。
+	// TLS 嗅探：客户端发起 TLS 握手则终止 TLS，br 为 nil；
+	// 非 TLS 连接返回原连接与含已窥探字节的缓冲读器（零丢失）。
+	// 注意：client 不允许被置为 nil——函数入口的 defer 在 panic
+	// 恢复后会调用 client.Close()，nil 会造成 defer 内二次 panic
+	// 击穿进程。握手失败时 detectTLS 返回 nil 连接，此处直接
+	// return，由 defer 关闭原始连接。
+	var br *bufio.Reader
+	if s.tlsConfig != nil {
+		tlsConn, tlsBR := s.detectTLS(client)
+		if tlsConn == nil {
+			return
+		}
+		client, br = tlsConn, tlsBR
+	}
+
+	// 未配置路由：纯透传，不做 HTTP 嗅探（TLS 连接透传解密后的明文）。
 	if s.httpSrv == nil {
-		s.forwardRaw(client, nil, nil)
+		s.forwardRaw(client, br, nil)
 		return
 	}
 
 	// 嗅探阶段读取期限：请求行迟迟不来（如服务端先说话的协议）
-	// 则按原始透传处理。
+	// 则按原始透传处理。TLS 非 TLS 分支的 br 已含窥探字节，续用。
 	_ = client.SetDeadline(time.Now().Add(s.cfg.Server.ReadHeaderTimeout))
-	br := bufio.NewReaderSize(client, sniffBufferSize)
+	if br == nil {
+		br = bufio.NewReaderSize(client, sniffBufferSize)
+	}
 	route, prefix := s.sniffAndRoute(br)
 	_ = client.SetDeadline(time.Time{})
 
@@ -130,6 +154,58 @@ func (s *Server) handleTCPConn(client net.Conn) {
 	// bufConn 重放，缓冲区中其余字节完整续读，零丢失。
 	l := newOneConnListener(&bufConn{Conn: client, prefix: prefix, r: br})
 	_ = s.httpSrv.Serve(l) // 阻塞至连接结束或 Shutdown 关闭该监听
+}
+
+// tlsRecordProbeLen 是 TLS record 头长度：内容类型(1) + 版本(2) +
+// 载荷长度(2)。
+const tlsRecordProbeLen = 5
+
+// isTLSRecordHead 判断 peek 到的 record 头是否为合法的 TLS
+// handshake record：内容类型 0x16（handshake）、主版本 0x03、
+// 次版本 0x00–0x04（SSLv3/TLS1.0–1.3）。第二字节要求 0x03 可
+// 有效排除以 0x16 开头但并非 TLS 的原始协议（如 Minecraft 的
+// VarInt 长度恰好为 22 的握手包）。
+func isTLSRecordHead(head []byte) bool {
+	return len(head) >= tlsRecordProbeLen &&
+		head[0] == 0x16 && head[1] == 0x03 && head[2] <= 0x04
+}
+
+// detectTLS 嗅探连接首字节，判断客户端是否发起 TLS 握手，实现
+// 单端口同时服务 HTTPS 与原始 TCP（如 Minecraft）：
+//
+//   - 首字节为 0x16（TLS record，content-type = handshake）且随后
+//     四字节构成合法 record 头（版本 0x03 0x0[0-4]）时，完成服务端
+//     TLS 握手并返回 (tls.Conn, nil)，后续按解密后的明文处理；
+//   - 其余情况（含首字节迟迟不到或对端提前关闭）返回原连接与
+//     含已窥探字节的缓冲读器，已收字节零丢失地进入后续透传/
+//     HTTP 分流；
+//   - 确认是 TLS 但握手失败时返回 (nil, nil)，连接将被关闭。
+func (s *Server) detectTLS(client net.Conn) (net.Conn, *bufio.Reader) {
+	br := bufio.NewReaderSize(client, sniffBufferSize)
+	_ = client.SetDeadline(time.Now().Add(s.cfg.Server.ReadHeaderTimeout))
+
+	head, err := br.Peek(tlsRecordProbeLen)
+	if err != nil {
+		// 首字节超时或 EOF：按非 TLS 处理，与未配置 TLS 时的
+		// 嗅探语义一致（服务端先说话的协议照旧透传）。
+		_ = client.SetDeadline(time.Time{})
+		return client, br
+	}
+	if !isTLSRecordHead(head) {
+		// 非 TLS：原始字节（含已窥探部分）零丢失进入后续流程。
+		_ = client.SetDeadline(time.Time{})
+		return client, br
+	}
+
+	tc := tls.Server(&prefixConn{Conn: client, r: br}, s.tlsConfig)
+	err = tc.Handshake()
+	_ = client.SetDeadline(time.Time{})
+	if err != nil {
+		s.logger.Debug("gateway: tls handshake failed",
+			"remote", client.RemoteAddr().String(), "error", err)
+		return nil, nil
+	}
+	return tc, nil
 }
 
 // sniffAndRoute 判断连接是否走 HTTP 反向代理。
@@ -272,6 +348,16 @@ func (c *bufConn) Read(p []byte) (int, error) {
 	}
 	return c.r.Read(p)
 }
+
+// prefixConn 在嗅探阶段已用 br 从底层连接读取字节后，把连接交给
+// tls.Server 做 TLS 握手：Read 先消费缓冲区中已收到的字节（如
+// ClientHello 的前几个字节），再经 br 续读底层连接，数据零丢失。
+type prefixConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // oneConnListener 把单条已建立的连接包装成 net.Listener，
 // 交给 http.Server.Serve 处理；Close 由 Server.Shutdown 触发。

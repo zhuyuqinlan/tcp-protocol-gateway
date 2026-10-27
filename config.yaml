@@ -1,9 +1,12 @@
 server:
   listen: "0.0.0.0:32920"
   read_header_timeout: 10s
-  # 同时配置 tls_cert 与 tls_key 即启用 HTTPS（TLS 在本网关终止）。
-  # tls_cert: "cert.pem"
-  # tls_key: "key.pem"
+  # 同时配置 tls_cert 与 tls_key 即启用 TLS（在本网关终止）。
+  # TLS 按连接嗅探：HTTPS 请求与 MC 等原始 TCP 连接可共用本端口，
+  # 互不影响。
+  # Let's Encrypt 证书（certbot 签发后路径，域名按实际修改）。
+  tls_cert: "./zhuyuqinlan.top.crt"
+  tls_key: "./zhuyuqinlan.top.key"
 
 http:
   connect_timeout: 5s

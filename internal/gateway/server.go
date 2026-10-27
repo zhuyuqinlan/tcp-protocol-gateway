@@ -4,6 +4,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,7 +25,10 @@ var ErrServerClosed = errors.New("gateway: server closed")
 //     不做任何协议解析
 //   - 命中：配置了 routes.http 时，对嗅探到 HTTP 请求行且路径命中
 //     前缀的连接改走 HTTP 反向代理；未命中的连接照旧透传
-//   - 未配置 routes 时不嗅探，即纯 TCP 透传，零开销
+//   - 配置了 TLS 证书时按连接嗅探：客户端发起 TLS 握手则网关终止
+//     TLS 后按上述规则处理解密明文，非 TLS 连接（如 Minecraft 等
+//     原始 TCP 协议）不受影响，单端口同时服务 HTTPS 与 TCP
+//   - 未配置 routes 时不做 HTTP 嗅探，即纯 TCP 透传，零开销
 type Server struct {
 	cfg    *config.Config
 	logger *slog.Logger
@@ -32,6 +36,10 @@ type Server struct {
 	// 配置了 routes.http 时创建：命中前缀的连接复用该服务器。
 	httpSrv *http.Server
 	router  *proxy.Router
+
+	// 配置了 TLS 证书时创建：用于按连接嗅探（首字节为 TLS record
+	// 时终止 TLS），使单端口同时服务 HTTPS 与原始 TCP。
+	tlsConfig *tls.Config
 
 	listener net.Listener
 
