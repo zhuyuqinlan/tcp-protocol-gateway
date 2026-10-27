@@ -13,32 +13,45 @@ import (
 	"time"
 )
 
-// ServerConfig TCP 监听相关配置。
+// ServerConfig HTTP(S) 监听相关配置。
 type ServerConfig struct {
-	Listen           string        `yaml:"listen"`
-	MaxConnections   int           `yaml:"max_connections"`
-	HandshakeTimeout time.Duration `yaml:"handshake_timeout"`
-	IdleTimeout      time.Duration `yaml:"idle_timeout"`
+	// Listen 是网关直接监听的地址（HTTP 或 HTTPS 由 TLS 配置决定）。
+	Listen string `yaml:"listen"`
+	// ReadHeaderTimeout 是读取请求头（含 TLS 握手后的首个请求）的期限，
+	// 防止慢连接长期占用 goroutine。
+	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
+	// TLSCertFile / TLSKeyFile 均非空时启用 HTTPS（TLS 终止在本网关）。
+	TLSCertFile string `yaml:"tls_cert"`
+	TLSKeyFile  string `yaml:"tls_key"`
+}
+
+// TLSEnabled 返回是否启用 HTTPS。
+func (s ServerConfig) TLSEnabled() bool {
+	return s.TLSCertFile != "" || s.TLSKeyFile != ""
 }
 
 // HTTPConfig HTTP 代理全局配置。
 type HTTPConfig struct {
+	// ConnectTimeout 是连接后端的拨号超时。
 	ConnectTimeout time.Duration `yaml:"connect_timeout"`
+	// TLSSkipVerify 为 true 时，网关不校验 HTTPS 后端返回的证书
+	// （自签名证书场景使用，仅建议测试环境开启）。
+	TLSSkipVerify bool `yaml:"tls_skip_verify"`
 }
 
 // HTTPRoute 是一条 HTTP 路径前缀路由。
 type HTTPRoute struct {
 	// Backend 是该前缀命中的请求转发目标。
 	Backend string `yaml:"backend"`
-	// StripPrefix 为 true 时，转发前把命中的前缀从请求行
-	// 的 request-target 中剥掉（如 /api/users → /users；
-	// 剥完为空时转发为 /）。false 表示透明转发（保留前缀）。
+	// StripPrefix 为 true 时，转发前把命中的前缀从请求路径中
+	// 剥掉（如 /api/users → /users；剥完为空时转发为 /）。
+	// false 表示透明转发（保留前缀）。
 	StripPrefix bool `yaml:"strip_prefix"`
 }
 
-// RoutesConfig 多路由映射表。
+// RoutesConfig HTTP 路径前缀路由表。
 //
-// 配置形式（键为前缀/监听地址）：
+// 配置形式（键为路径前缀）：
 //
 //	routes:
 //	  http:                          # 路径前缀 -> HTTP 后端（最长前缀优先）
@@ -46,29 +59,9 @@ type HTTPRoute struct {
 //	    "/web":                      # 完整形式：可配置前缀剥离
 //	      backend: "127.0.0.1:8081"
 //	      strip_prefix: true
-//	  tcp:                       # 监听地址 -> TCP 后端（原始字节转发）
-//	    "0.0.0.0:30000": "127.0.0.1:9000"
-//	  udp:                       # 监听地址 -> UDP 后端（数据报转发）
-//	    "0.0.0.0:5353": "8.8.8.8:53"
 type RoutesConfig struct {
-	// HTTP 是路径前缀到后端的映射，仅作用于主监听端口。
+	// HTTP 是路径前缀到后端的映射，作用于监听端口。
 	HTTP map[string]HTTPRoute `yaml:"http"`
-	// TCP 是监听地址到后端的映射，每个条目独立监听一个 TCP 端口，
-	// 将连接的字节流原样转发到后端。
-	TCP map[string]string `yaml:"tcp"`
-	// UDP 是监听地址到后端的映射，每个条目独立监听一个 UDP 端口，
-	// 按客户端地址维持会话转发数据报。
-	UDP map[string]string `yaml:"udp"`
-}
-
-// MinecraftConfig Minecraft SLP 模拟配置。
-type MinecraftConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	VersionName     string `yaml:"version_name"`
-	ProtocolVersion int32  `yaml:"protocol_version"`
-	MOTD            string `yaml:"motd"`
-	MaxPlayers      int    `yaml:"max_players"`
-	OnlinePlayers   int    `yaml:"online_players"`
 }
 
 // LoggingConfig 日志配置。
@@ -78,11 +71,13 @@ type LoggingConfig struct {
 
 // Config 顶层配置。
 type Config struct {
-	Server    ServerConfig    `yaml:"server"`
-	HTTP      HTTPConfig      `yaml:"http"`
-	Routes    RoutesConfig    `yaml:"routes"`
-	Minecraft MinecraftConfig `yaml:"minecraft"`
-	Logging   LoggingConfig   `yaml:"logging"`
+	Server  ServerConfig  `yaml:"server"`
+	HTTP    HTTPConfig    `yaml:"http"`
+	// Backend 是默认后端 TCP 地址：连接未命中任何 HTTP 前缀路由时，
+	// 整条连接原始透传到该地址。
+	Backend string       `yaml:"backend"`
+	Routes  RoutesConfig `yaml:"routes"`
+	Logging LoggingConfig `yaml:"logging"`
 }
 
 // Defaults 返回一份带全部默认值的配置。未在配置文件中出现的字段
@@ -90,26 +85,15 @@ type Config struct {
 func Defaults() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Listen:           "0.0.0.0:25565",
-			MaxConnections:   1000,
-			HandshakeTimeout: 5 * time.Second,
-			IdleTimeout:      60 * time.Second,
+			Listen:            "0.0.0.0:8000",
+			ReadHeaderTimeout: 10 * time.Second,
 		},
 		HTTP: HTTPConfig{
 			ConnectTimeout: 5 * time.Second,
 		},
+		Backend: "127.0.0.1:8080",
 		Routes: RoutesConfig{
 			HTTP: map[string]HTTPRoute{},
-			TCP:  map[string]string{},
-			UDP:  map[string]string{},
-		},
-		Minecraft: MinecraftConfig{
-			Enabled:         true,
-			VersionName:     "1.20.1",
-			ProtocolVersion: 763,
-			MOTD:            "Go TCP Protocol Gateway",
-			MaxPlayers:      100,
-			OnlinePlayers:   0,
 		},
 		Logging: LoggingConfig{
 			Level: "info",
@@ -139,58 +123,34 @@ func Load(path string) (*Config, error) {
 		if err := decodeString(m, "listen", &cfg.Server.Listen); err != nil {
 			return err
 		}
-		if err := decodeInt(m, "max_connections", &cfg.Server.MaxConnections); err != nil {
+		if err := decodeString(m, "tls_cert", &cfg.Server.TLSCertFile); err != nil {
 			return err
 		}
-		if err := decodeDuration(m, "handshake_timeout", &cfg.Server.HandshakeTimeout); err != nil {
+		if err := decodeString(m, "tls_key", &cfg.Server.TLSKeyFile); err != nil {
 			return err
 		}
-		return decodeDuration(m, "idle_timeout", &cfg.Server.IdleTimeout)
+		return decodeDuration(m, "read_header_timeout", &cfg.Server.ReadHeaderTimeout)
 	}); err != nil {
 		return nil, fmt.Errorf("section server: %w", err)
 	}
 
 	if err := applySection(root, "http", func(m map[string]any) error {
-		return decodeDuration(m, "connect_timeout", &cfg.HTTP.ConnectTimeout)
+		if err := decodeDuration(m, "connect_timeout", &cfg.HTTP.ConnectTimeout); err != nil {
+			return err
+		}
+		return decodeBool(m, "tls_skip_verify", &cfg.HTTP.TLSSkipVerify)
 	}); err != nil {
 		return nil, fmt.Errorf("section http: %w", err)
 	}
 
 	if err := applySection(root, "routes", func(m map[string]any) error {
-		if err := decodeHTTPRoutes(m, "http", cfg.Routes.HTTP); err != nil {
-			return err
-		}
-		if err := decodeStringMap(m, "tcp", cfg.Routes.TCP); err != nil {
-			return err
-		}
-		return decodeStringMap(m, "udp", cfg.Routes.UDP)
+		return decodeHTTPRoutes(m, "http", cfg.Routes.HTTP)
 	}); err != nil {
 		return nil, fmt.Errorf("section routes: %w", err)
 	}
 
-	if err := applySection(root, "minecraft", func(m map[string]any) error {
-		if v, ok := m["enabled"]; ok {
-			b, err := parseBool(v)
-			if err != nil {
-				return fmt.Errorf("field enabled: %w", err)
-			}
-			cfg.Minecraft.Enabled = b
-		}
-		if err := decodeString(m, "version_name", &cfg.Minecraft.VersionName); err != nil {
-			return err
-		}
-		if err := decodeString(m, "motd", &cfg.Minecraft.MOTD); err != nil {
-			return err
-		}
-		if err := decodeInt32(m, "protocol_version", &cfg.Minecraft.ProtocolVersion); err != nil {
-			return err
-		}
-		if err := decodeInt(m, "max_players", &cfg.Minecraft.MaxPlayers); err != nil {
-			return err
-		}
-		return decodeInt(m, "online_players", &cfg.Minecraft.OnlinePlayers)
-	}); err != nil {
-		return nil, fmt.Errorf("section minecraft: %w", err)
+	if err := decodeString(root, "backend", &cfg.Backend); err != nil {
+		return nil, fmt.Errorf("field backend: %w", err)
 	}
 
 	if err := applySection(root, "logging", func(m map[string]any) error {
@@ -206,17 +166,17 @@ func (c *Config) validate() error {
 	if c.Server.Listen == "" {
 		return fmt.Errorf("server.listen must not be empty")
 	}
-	if c.Server.MaxConnections <= 0 {
-		return fmt.Errorf("server.max_connections must be > 0, got %d", c.Server.MaxConnections)
-	}
-	if c.Server.HandshakeTimeout <= 0 {
-		return fmt.Errorf("server.handshake_timeout must be > 0")
-	}
-	if c.Server.IdleTimeout <= 0 {
-		return fmt.Errorf("server.idle_timeout must be > 0")
+	if c.Server.ReadHeaderTimeout <= 0 {
+		return fmt.Errorf("server.read_header_timeout must be > 0")
 	}
 	if c.HTTP.ConnectTimeout <= 0 {
 		return fmt.Errorf("http.connect_timeout must be > 0")
+	}
+	if c.Backend == "" {
+		return fmt.Errorf("backend must not be empty")
+	}
+	if c.Server.TLSEnabled() && (c.Server.TLSCertFile == "" || c.Server.TLSKeyFile == "") {
+		return fmt.Errorf("server.tls_cert and server.tls_key must be configured together")
 	}
 	for prefix, route := range c.Routes.HTTP {
 		if !strings.HasPrefix(prefix, "/") {
@@ -224,22 +184,6 @@ func (c *Config) validate() error {
 		}
 		if route.Backend == "" {
 			return fmt.Errorf("routes.http[%s]: backend must not be empty", prefix)
-		}
-	}
-	for listen, backend := range c.Routes.TCP {
-		if listen == "" {
-			return fmt.Errorf("routes.tcp listen must not be empty")
-		}
-		if backend == "" {
-			return fmt.Errorf("routes.tcp[%s]: backend must not be empty", listen)
-		}
-	}
-	for listen, backend := range c.Routes.UDP {
-		if listen == "" {
-			return fmt.Errorf("routes.udp listen must not be empty")
-		}
-		if backend == "" {
-			return fmt.Errorf("routes.udp[%s]: backend must not be empty", listen)
 		}
 	}
 	switch strings.ToLower(c.Logging.Level) {
@@ -273,30 +217,6 @@ func decodeString(m map[string]any, key string, dst *string) error {
 		return fmt.Errorf("field %s: expected string, got %T", key, v)
 	}
 	*dst = s
-	return nil
-}
-
-// decodeStringMap 将 m[key]（"key: value" 形式的映射）解码到 dst，
-// 仅保留字符串值。
-func decodeStringMap(m map[string]any, key string, dst map[string]string) error {
-	v, ok := m[key]
-	if !ok || v == nil {
-		return nil
-	}
-	sub, ok := v.(map[string]any)
-	if !ok {
-		return fmt.Errorf("field %s: expected a mapping", key)
-	}
-	for k, sv := range sub {
-		if sv == nil {
-			continue
-		}
-		s, ok := sv.(string)
-		if !ok {
-			return fmt.Errorf("field %s.%s: expected string value, got %T", key, k, sv)
-		}
-		dst[k] = s
-	}
 	return nil
 }
 
@@ -342,32 +262,6 @@ func decodeHTTPRoutes(m map[string]any, key string, dst map[string]HTTPRoute) er
 	return nil
 }
 
-func decodeInt(m map[string]any, key string, dst *int) error {
-	v, ok := m[key]
-	if !ok || v == nil {
-		return nil
-	}
-	n, err := parseInt(v)
-	if err != nil {
-		return fmt.Errorf("field %s: %w", key, err)
-	}
-	*dst = n
-	return nil
-}
-
-func decodeInt32(m map[string]any, key string, dst *int32) error {
-	v, ok := m[key]
-	if !ok || v == nil {
-		return nil
-	}
-	n, err := parseInt(v)
-	if err != nil {
-		return fmt.Errorf("field %s: %w", key, err)
-	}
-	*dst = int32(n)
-	return nil
-}
-
 func decodeDuration(m map[string]any, key string, dst *time.Duration) error {
 	v, present := m[key]
 	if !present || v == nil {
@@ -388,21 +282,6 @@ func decodeDuration(m map[string]any, key string, dst *time.Duration) error {
 	return nil
 }
 
-func parseInt(v any) (int, error) {
-	switch t := v.(type) {
-	case int:
-		return t, nil
-	case string:
-		n, err := strconv.Atoi(strings.TrimSpace(t))
-		if err != nil {
-			return 0, fmt.Errorf("invalid integer %q", t)
-		}
-		return n, nil
-	default:
-		return 0, fmt.Errorf("expected integer, got %T", v)
-	}
-}
-
 func parseBool(v any) (bool, error) {
 	switch t := v.(type) {
 	case bool:
@@ -416,4 +295,17 @@ func parseBool(v any) (bool, error) {
 	default:
 		return false, fmt.Errorf("expected bool, got %T", v)
 	}
+}
+
+func decodeBool(m map[string]any, key string, dst *bool) error {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	b, err := parseBool(v)
+	if err != nil {
+		return fmt.Errorf("field %s: %w", key, err)
+	}
+	*dst = b
+	return nil
 }

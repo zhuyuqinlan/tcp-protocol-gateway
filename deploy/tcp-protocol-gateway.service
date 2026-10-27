@@ -1,5 +1,5 @@
 [Unit]
-Description=TCP Multi-Protocol Gateway
+Description=HTTP(S) Reverse Proxy Gateway
 Documentation=file:/usr/local/share/doc/tcp-protocol-gateway/README.md
 After=network-online.target
 Wants=network-online.target

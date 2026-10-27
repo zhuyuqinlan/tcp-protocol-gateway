@@ -1,4 +1,4 @@
-// Command gateway 是 TCP 多协议网关的入口。
+// Command gateway 是 HTTP(S) 反向代理网关的入口。
 //
 // 用法:
 //
@@ -64,7 +64,8 @@ func main() {
 	logger.Info("tcp-protocol-gateway starting",
 		"config", *configPath,
 		"listen", cfg.Server.Listen,
-		"minecraft_enabled", cfg.Minecraft.Enabled)
+		"tls", cfg.Server.TLSEnabled(),
+		"backend", cfg.Backend)
 
 	err = srv.ListenAndServe()
 	if err == gateway.ErrServerClosed {

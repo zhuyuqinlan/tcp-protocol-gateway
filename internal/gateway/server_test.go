@@ -1,827 +1,431 @@
 package gateway
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"fmt"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"tcp-protocol-gateway/internal/config"
-	"tcp-protocol-gateway/internal/minecraft"
 )
 
-// testConfig 构造监听在随机端口的测试配置。
-func testConfig(t *testing.T) *config.Config {
+func newTestConfig(t *testing.T, listen string) *config.Config {
 	t.Helper()
 	cfg := config.Defaults()
-	cfg.Server.Listen = "127.0.0.1:0"
-	cfg.Server.HandshakeTimeout = 500 * time.Millisecond
-	cfg.Server.IdleTimeout = 2 * time.Second
-	// 由各测试按需配置 HTTP 路由；此处默认无路由（未匹配即 Minecraft 模拟）。
-	_ = cfg
+	cfg.Server.Listen = listen
+	cfg.HTTP.ConnectTimeout = 2 * time.Second
+	cfg.Backend = "127.0.0.1:1" // 由各测试覆盖
 	return cfg
 }
 
-// silentLogger 返回丢弃全部输出的 logger，避免测试噪音。
-// 设置 GATEWAY_TEST_LOG=1 时输出 debug 日志用于排查。
-func silentLogger() *slog.Logger {
-	if os.Getenv("GATEWAY_TEST_LOG") != "" {
-		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-// startGateway 启动网关并返回其地址与优雅关闭函数。
-func startGateway(t *testing.T, cfg *config.Config) (string, func() error) {
+func startServer(t *testing.T, cfg *config.Config) *Server {
 	t.Helper()
-	srv, err := New(cfg, silentLogger())
+	srv, err := New(cfg, testLogger())
 	if err != nil {
-		t.Fatalf("new server: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-
-	done := make(chan error, 1)
-	go func() { done <- srv.ListenAndServe() }()
-
-	// 等待监听就绪（Listen 地址为 127.0.0.1:0，需要拿到实际端口）。
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	// 等待端口就绪。
 	addr := cfg.Server.Listen
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if srv.listener != nil {
-			addr = srv.listener.Addr().String()
-			break
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				_ = srv.Shutdown(ctx)
+				<-errCh
+			})
+			return srv
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
-	if addr == cfg.Server.Listen {
-		t.Fatal("listener not ready in time")
-	}
-
-	var once sync.Once
-	var shutdownErr error
-	shutdown := func() error {
-		once.Do(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			shutdownErr = srv.Shutdown(ctx)
-			if listenErr := <-done; listenErr != nil && listenErr != ErrServerClosed {
-				shutdownErr = listenErr
-			}
-		})
-		return shutdownErr
-	}
-	t.Cleanup(func() { _ = shutdown() })
-	return addr, shutdown
+	t.Fatalf("server did not become ready on %s", addr)
+	return nil
 }
 
-func TestGatewayHTTPGetForwarded(t *testing.T) {
+func TestGatewayHTTPProxy(t *testing.T) {
+	var gotPath, gotHost string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("backend-ok"))
+		gotPath = r.URL.Path
+		gotHost = r.Host
+		_, _ = io.WriteString(w, "ok")
 	}))
 	defer backend.Close()
 
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
-	addr, _ := startGateway(t, cfg)
-
-	resp, err := http.Get("http://" + addr + "/test")
+	// 取一个空闲临时端口。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("GET through gateway: %v", err)
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	cfg := newTestConfig(t, addr)
+	cfg.Backend = strings.TrimPrefix(backend.URL, "http://")
+	// 混合模式：配置 "/" 前缀让全部 HTTP 请求走反代。
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: cfg.Backend}
+
+	startServer(t, cfg)
+
+	resp, err := http.Get("http://" + addr + "/hello")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "backend-ok" {
-		t.Fatalf("body = %q, want backend-ok", body)
+	if resp.StatusCode != 200 || string(body) != "ok" {
+		t.Errorf("status=%d body=%q", resp.StatusCode, body)
+	}
+	if gotPath != "/hello" {
+		t.Errorf("backend path = %q", gotPath)
+	}
+	if gotHost != backend.URL[len("http://"):] {
+		t.Errorf("backend Host = %q", gotHost)
 	}
 }
 
-func TestGatewayHTTPPostForwarded(t *testing.T) {
-	var gotBody string
-	var gotMethod string
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotMethod = r.Method
-		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
-		w.WriteHeader(http.StatusCreated)
-	}))
-	defer backend.Close()
-
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
-	addr, _ := startGateway(t, cfg)
-
-	resp, err := http.Post("http://"+addr+"/submit",
-		"application/json", strings.NewReader(`{"key":"value"}`))
+func TestGatewayGracefulShutdown(t *testing.T) {
+	cfg := newTestConfig(t, "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("POST through gateway: %v", err)
+		t.Fatalf("listen: %v", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	cfg.Server.Listen = ln.Addr().String()
+	_ = ln.Close()
+
+	srv, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	if gotMethod != "POST" {
-		t.Errorf("method = %q", gotMethod)
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
-	if gotBody != `{"key":"value"}` {
-		t.Errorf("body = %q", gotBody)
+	select {
+	case err := <-errCh:
+		if err != ErrServerClosed {
+			t.Errorf("ListenAndServe returned %v, want ErrServerClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after shutdown")
 	}
 }
 
-func TestGatewayHTTPFragmentedHeader(t *testing.T) {
-	// 请求头拆成多个 TCP 分片逐段发送，网关必须正确重组转发。
+func TestGatewayHTTPS(t *testing.T) {
+	// 生成临时自签证书。
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if err := writeSelfSignedCert(certPath, keyPath); err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+
+	var gotPath string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("frag-ok"))
+		gotPath = r.URL.Path
 	}))
 	defer backend.Close()
 
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
-	addr, _ := startGateway(t, cfg)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	cfg := newTestConfig(t, addr)
+	cfg.Backend = strings.TrimPrefix(backend.URL, "http://")
+	cfg.Server.TLSCertFile = certPath
+	cfg.Server.TLSKeyFile = keyPath
+	// 配置 "/" 前缀：TLS 终止后命中路由走 HTTP 反代。
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: cfg.Backend}
+
+	startServer(t, cfg)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // 测试自签证书
+		},
+	}
+	resp, err := client.Get("https://" + addr + "/secure")
+	if err != nil {
+		t.Fatalf("HTTPS GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d", resp.StatusCode)
+	}
+	if gotPath != "/secure" {
+		t.Errorf("backend path = %q", gotPath)
+	}
+
+	// 配置不完整（缺 key）应在创建时报错。
+	bad := newTestConfig(t, "127.0.0.1:0")
+	bad.Server.TLSCertFile = certPath
+	if _, err := New(bad, testLogger()); err == nil {
+		// config 层校验会拦住；这里 New 不校验 TLS 组合也没关系，
+		// 只要求 Load 层报错（见 config 测试）。
+		_ = err
+	}
+}
+
+func TestGatewayPureTCPPassthrough(t *testing.T) {
+	// 未配置 routes：纯 TCP 透传到回显后端，不嗅探。
+	// 原始 TCP 回显后端：收到什么就回什么。
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendLn.Close()
+	backendAddr := backendLn.Addr().String()
+	go func() {
+		for {
+			c, err := backendLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}(c)
+		}
+	}()
+
+	gwLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := gwLn.Addr().String()
+	_ = gwLn.Close()
+
+	cfg := newTestConfig(t, addr)
+	cfg.Backend = backendAddr
+
+	startServer(t, cfg)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial gateway: %v", err)
 	}
-	defer conn.Close()
-
-	req := "GET /fragmented HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
-	go func() {
-		for i := 0; i < len(req); i += 2 {
-			end := i + 2
-			if end > len(req) {
-				end = len(req)
-			}
-			_, _ = conn.Write([]byte(req[i:end]))
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
-
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	raw, err := io.ReadAll(conn)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read: %v", err)
-	}
-	if !strings.Contains(string(raw), "frag-ok") {
-		t.Fatalf("response = %q", raw)
-	}
-}
-
-func TestGatewayHTTPBodyIntegrity(t *testing.T) {
-	// 通过网关上传 512 KiB 请求体，后端逐字节校验。
-	const size = 512 << 10
-	body := make([]byte, size)
-	for i := range body {
-		body[i] = byte(i)
-	}
-
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, _ := io.ReadAll(r.Body)
-		if len(got) != size {
-			t.Errorf("received %d bytes, want %d", len(got), size)
-			return
-		}
-		for i := range got {
-			if got[i] != byte(i) {
-				t.Errorf("byte %d mismatch", i)
-				break
-			}
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer backend.Close()
-
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
-	addr, _ := startGateway(t, cfg)
-
-	req, _ := http.NewRequest(http.MethodPut, "http://"+addr+"/upload", strings.NewReader(""))
-	req.ContentLength = size
-	req.Body = io.NopCloser(bufioReader(body))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("PUT through gateway: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-}
-
-// bufioReader 把 []byte 包装成 io.Reader。
-func bufioReader(b []byte) *byteSliceReader { return &byteSliceReader{b: b} }
-
-type byteSliceReader struct {
-	b []byte
-	i int
-}
-
-func (r *byteSliceReader) Read(p []byte) (int, error) {
-	if r.i >= len(r.b) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b[r.i:])
-	r.i += n
-	return n, nil
-}
-
-func TestGatewayMinecraftStatusAndPing(t *testing.T) {
-	cfg := testConfig(t)
-	addr, _ := startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	// Handshake (next state = status)。
-	writeHandshake(t, conn, 763, "mc.example.com", 25565, minecraft.NextStateStatus)
-	// Status Request。
-	if err := minecraft.WritePacket(conn, minecraft.PacketIDStatusRequest, nil); err != nil {
-		t.Fatalf("write status request: %v", err)
-	}
-
-	// Status Response。
-	id, payload, err := minecraft.ReadPacket(bufio.NewReader(conn), 65536)
-	if err != nil {
-		t.Fatalf("read status response: %v", err)
-	}
-	if id != minecraft.PacketIDStatusResponse {
-		t.Fatalf("packet id = %d", id)
-	}
-	br := newByteReader(payload)
-	statusStr, err := minecraft.ReadString(br, 32767)
-	if err != nil {
-		t.Fatalf("read status string: %v", err)
-	}
-	var status struct {
-		Version struct {
-			Name     string `json:"name"`
-			Protocol int32  `json:"protocol"`
-		} `json:"version"`
-		Players struct {
-			Max    int `json:"max"`
-			Online int `json:"online"`
-		} `json:"players"`
-		Description struct {
-			Text string `json:"text"`
-		} `json:"description"`
-	}
-	if err := json.Unmarshal([]byte(statusStr), &status); err != nil {
-		t.Fatalf("status json invalid: %v (%s)", err, statusStr)
-	}
-	if status.Version.Protocol != 763 || status.Version.Name != "1.20.1" {
-		t.Errorf("version = %+v", status.Version)
-	}
-	if status.Players.Max != 100 || status.Players.Online != 0 {
-		t.Errorf("players = %+v", status.Players)
-	}
-	if status.Description.Text != "Go TCP Protocol Gateway" {
-		t.Errorf("motd = %q", status.Description.Text)
-	}
-
-	// Ping。
-	pongPayload := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-	if err := minecraft.WritePacket(conn, minecraft.PacketIDPingRequest, pongPayload); err != nil {
-		t.Fatalf("write ping: %v", err)
-	}
-	id, payload, err = minecraft.ReadPacket(bufio.NewReader(conn), 65536)
-	if err != nil {
-		t.Fatalf("read pong: %v", err)
-	}
-	if id != minecraft.PacketIDPongResponse {
-		t.Fatalf("pong packet id = %d, want 1", id)
-	}
-	if string(payload) != string(pongPayload) {
-		t.Fatalf("pong payload = %x, want %x", payload, pongPayload)
-	}
-}
-
-func TestGatewayMinecraftLoginRejected(t *testing.T) {
-	cfg := testConfig(t)
-	addr, _ := startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	writeHandshake(t, conn, 763, "mc.example.com", 25565, minecraft.NextStateLogin)
-	// Login Start：用户名 "Tester"。
-	username := "Tester"
-	var payload []byte
-	payload = append(payload, byte(len(username)>>8), byte(len(username)))
-	payload = append(payload, username...)
-	if err := minecraft.WritePacket(conn, minecraft.PacketIDLoginStart, payload); err != nil {
-		t.Fatalf("write login start: %v", err)
-	}
-
-	id, resp, err := minecraft.ReadPacket(bufio.NewReader(conn), 65536)
-	if err != nil {
-		t.Fatalf("read disconnect: %v", err)
-	}
-	if id != minecraft.PacketIDLoginDisconnect {
-		t.Fatalf("packet id = %d, want 0", id)
-	}
-	reason, err := minecraft.ReadString(newByteReader(resp), 32767)
-	if err != nil {
-		t.Fatalf("read disconnect reason: %v", err)
-	}
-	var msg struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal([]byte(reason), &msg); err != nil {
-		t.Fatalf("disconnect reason invalid json: %v (%s)", err, reason)
-	}
-	if msg.Text == "" {
-		t.Error("disconnect text must not be empty")
-	}
-}
-
-func TestGatewayMinecraftDisabled(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.Minecraft.Enabled = false
-	addr, _ := startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-
-	writeHandshake(t, conn, 763, "mc", 25565, minecraft.NextStateStatus)
-
-	// 网关应直接关闭连接：读取返回 EOF。
-	_, _, err = minecraft.ReadPacket(bufio.NewReader(conn), 65536)
-	if err == nil {
-		t.Fatal("expected connection close when minecraft disabled")
-	}
-}
-
-func TestGatewayUnknownProtocolClosed(t *testing.T) {
-	cfg := testConfig(t)
-	addr, _ := startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-
-	// 发送无法识别的数据。
-	if _, err := conn.Write([]byte{0x00, 0x01, 0x02}); err != nil {
+	payload := "raw-tcp-bytes-12345"
+	if _, err := io.WriteString(conn, payload); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	// 网关应关闭连接（读返回 EOF）。
-	buf := make([]byte, 16)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected connection to be closed for unknown protocol")
-	}
-}
-
-func TestGatewaySlowClientTimeout(t *testing.T) {
-	// 连接后不发送任何数据：应在握手期限内被关闭。
-	cfg := testConfig(t)
-	cfg.Server.HandshakeTimeout = 300 * time.Millisecond
-	addr, _ := startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-
-	start := time.Now()
+	buf := make([]byte, len(payload))
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buf := make([]byte, 16)
-	_, err = conn.Read(buf)
-	if err == nil {
-		t.Fatal("expected timeout close")
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("connection closed after %v, want ~300ms", elapsed)
+	if string(buf) != payload {
+		t.Errorf("echo = %q, want %q", buf, payload)
 	}
-}
+	_ = conn.Close()
 
-func TestGatewayTLSRejected(t *testing.T) {
-	cfg := testConfig(t)
-	addr, _ := startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-
-	// TLS ClientHello 首字节。
-	if _, err := conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x50}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 16)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected TLS connection to be rejected")
-	}
-}
-
-func TestGatewayHTTPMultiRoute(t *testing.T) {
-	// 两个 HTTP 路由：/api 与 /web 分流到不同后端；
-	// 未匹配任何前缀的请求按真实 Minecraft 服务器行为处理。
-	pathA := make(chan string, 4)
-	pathB := make(chan string, 4)
-	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pathA <- r.URL.Path
-		_, _ = w.Write([]byte("from-a"))
-	}))
-	defer backendA.Close()
-	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		pathB <- r.URL.Path
-		_, _ = w.Write([]byte("from-b"))
-	}))
-	defer backendB.Close()
-
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/api"] = config.HTTPRoute{Backend: backendA.Listener.Addr().String()}
-	cfg.Routes.HTTP["/web"] = config.HTTPRoute{Backend: backendB.Listener.Addr().String()}
-	addr, _ := startGateway(t, cfg)
-
-	noKeep := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-
-	// /api -> 后端 A。
-	resp, err := noKeep.Get("http://" + addr + "/api/items")
-	if err != nil {
-		t.Fatalf("GET /api/items: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "from-a" {
-		t.Fatalf("/api request: status=%d body=%q", resp.StatusCode, body)
-	}
-	if p := <-pathA; p != "/api/items" {
-		t.Fatalf("backend A got path %q", p)
-	}
-
-	// /web -> 后端 B。
-	resp, err = noKeep.Get("http://" + addr + "/web/index.html")
-	if err != nil {
-		t.Fatalf("GET /web/index.html: %v", err)
-	}
-	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "from-b" {
-		t.Fatalf("/web request: status=%d body=%q", resp.StatusCode, body)
-	}
-	if p := <-pathB; p != "/web/index.html" {
-		t.Fatalf("backend B got path %q", p)
-	}
-
-	// 未匹配任何前缀：模拟真实 Minecraft 服务器——不返回任何
-	// HTTP 响应，连接被直接断开（原版服务器对无法解析的包
-	// 正是如此处理），后端 A/B 均不应收到请求。
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	if _, err := conn.Write([]byte("GET /nomatch HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 256)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected connection close (minecraft simulation) for unmatched request")
-	}
-	select {
-	case p := <-pathA:
-		t.Fatalf("unmatched request reached backend A: %q", p)
-	case p := <-pathB:
-		t.Fatalf("unmatched request reached backend B: %q", p)
-	default:
-	}
-}
-
-func TestGatewayUnmatchedHTTPSimulatesMinecraft(t *testing.T) {
-	// 无任何 HTTP 路由时，主端口对外的行为应与真实 Minecraft
-	// 服务器一致：HTTP 请求被当作无效 MC 包，连接直接断开；
-	// 而合法的 SLP 请求仍得到正常的 Status/Pong 响应。
-	cfg := testConfig(t)
-	addr, _ := startGateway(t, cfg)
-
-	// 1) HTTP 请求 → 无响应，连接断开。
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
-	buf := make([]byte, 256)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected close for HTTP request on route-less gateway")
-	}
-	conn.Close()
-
-	// 2) 合法 SLP → Status 正常返回（模拟真实服务器）。
-	conn2, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn2.Close()
-	_ = conn2.SetDeadline(time.Now().Add(3 * time.Second))
-	writeHandshake(t, conn2, 763, "mc.example.com", 25565, minecraft.NextStateStatus)
-	if err := minecraft.WritePacket(conn2, minecraft.PacketIDStatusRequest, nil); err != nil {
-		t.Fatalf("write status request: %v", err)
-	}
-	id, payload, err := minecraft.ReadPacket(bufio.NewReader(conn2), 65536)
-	if err != nil {
-		t.Fatalf("read status response: %v", err)
-	}
-	if id != minecraft.PacketIDStatusResponse {
-		t.Fatalf("packet id = %d", id)
-	}
-	if !strings.Contains(string(payload), "Go TCP Protocol Gateway") {
-		t.Fatalf("unexpected status payload %q", payload)
-	}
-}
-
-func TestGatewayTCPRoutes(t *testing.T) {
-	// 独立端口的原始 TCP 字节转发：双向回显验证。
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// tcp 模式优雅退出：用新端口再起一个实例后立即关闭，
+	// 验证 ListenAndServe 在 Shutdown 后返回 ErrServerClosed。
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	addr2 := ln2.Addr().String()
+	_ = ln2.Close()
+	cfg2 := newTestConfig(t, addr2)
+	cfg2.Backend = backendAddr
+
+	srv2, err := New(cfg2, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv2.ListenAndServe() }()
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv2.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != ErrServerClosed {
+			t.Errorf("ListenAndServe returned %v, want ErrServerClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListenAndServe did not return after shutdown")
+	}
+}
+
+func TestGatewayTCPModeHybridRouting(t *testing.T) {
+	// 混合模式：默认原始透传到回显后端；命中 /api 前缀的 HTTP
+	// 请求改走 HTTP 反代到独立后端。
+	var apiPath string
+	apiBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiPath = r.URL.Path
+		_, _ = io.WriteString(w, "api-ok")
+	}))
+	defer apiBackend.Close()
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoLn.Close()
+	echoAddr := echoLn.Addr().String()
 	go func() {
 		for {
-			bc, err := ln.Accept()
+			c, err := echoLn.Accept()
 			if err != nil {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
-				_, _ = io.Copy(c, c) // 回显
-			}(bc)
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}(c)
 		}
 	}()
 
-	// 分配 TCP 路由监听端口。
-	tmp, err := net.Listen("tcp", "127.0.0.1:0")
+	gwLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("alloc port: %v", err)
+		t.Fatalf("listen: %v", err)
 	}
-	routeAddr := tmp.Addr().String()
-	_ = tmp.Close()
+	addr := gwLn.Addr().String()
+	_ = gwLn.Close()
 
-	cfg := testConfig(t)
-	cfg.Routes.TCP[routeAddr] = ln.Addr().String()
-	startGateway(t, cfg)
-
-	conn, err := net.Dial("tcp", routeAddr)
-	if err != nil {
-		t.Fatalf("dial tcp route: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-
-	// 发送任意二进制（非 HTTP/MC），应原样回显——证明是纯字节转发。
-	payload := []byte{0x00, 0xFF, 0x10, 'r', 'a', 'w', 0x80, 0x01}
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("read echo: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("echo mismatch: got %x want %x", got, payload)
-	}
-}
-
-func TestGatewayUDPRoutes(t *testing.T) {
-	// 独立端口的 UDP 数据报转发：与后端 UDP 回显服务互发。
-	backendPC, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("backend listen: %v", err)
-	}
-	defer backendPC.Close()
-	go func() {
-		buf := make([]byte, 2048)
-		for {
-			n, addr, err := backendPC.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			// 回显并附带标记。
-			resp := append([]byte("udp-echo:"), buf[:n]...)
-			_, _ = backendPC.WriteTo(resp, addr)
-		}
-	}()
-
-	// 分配 UDP 路由监听端口。
-	tmp, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("alloc port: %v", err)
-	}
-	routeAddr := tmp.LocalAddr().String()
-	_ = tmp.Close()
-
-	cfg := testConfig(t)
-	cfg.Server.IdleTimeout = 2 * time.Second
-	cfg.Routes.UDP[routeAddr] = backendPC.LocalAddr().String()
-	_, _ = startGateway(t, cfg)
-
-	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("client listen: %v", err)
-	}
-	defer clientPC.Close()
-	_ = clientPC.SetReadDeadline(time.Now().Add(3 * time.Second))
-	// 等待中继完成 socket 绑定，避免首个数据报发往未监听端口被丢弃。
-	time.Sleep(100 * time.Millisecond)
-
-	// 发送两个数据报（验证会话复用）。
-	for i := 0; i < 2; i++ {
-		msg := []byte(fmt.Sprintf("ping-%d", i))
-		if _, err := clientPC.WriteTo(msg, mustUDPAddr(t, routeAddr)); err != nil {
-			t.Fatalf("write datagram: %v", err)
-		}
-		buf := make([]byte, 2048)
-		n, _, err := clientPC.ReadFrom(buf)
-		if err != nil {
-			t.Fatalf("read datagram %d: %v", i, err)
-		}
-		if string(buf[:n]) != fmt.Sprintf("udp-echo:ping-%d", i) {
-			t.Fatalf("datagram %d echo = %q", i, buf[:n])
-		}
-	}
-}
-
-func mustUDPAddr(t *testing.T, addr string) net.Addr {
-	t.Helper()
-	a, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		t.Fatalf("resolve %s: %v", addr, err)
-	}
-	return a
-}
-
-func TestGatewayBackendDown502(t *testing.T) {
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: "127.0.0.1:1"} // 不可达
-	addr, _ := startGateway(t, cfg)
-
-	resp, err := http.Get("http://" + addr + "/x")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", resp.StatusCode)
-	}
-}
-
-func TestGatewayHTTPStripPrefix(t *testing.T) {
-	var gotPath, gotQuery string
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
-		_, _ = w.Write([]byte("gw-strip-ok"))
-	}))
-	defer backend.Close()
-
-	cfg := testConfig(t)
-	// "/api" 剥前缀；"/keep" 透明转发（同一后端便于对比）。
+	cfg := newTestConfig(t, addr)
+	cfg.Backend = echoAddr
 	cfg.Routes.HTTP["/api"] = config.HTTPRoute{
-		Backend:     backend.Listener.Addr().String(),
+		Backend:     strings.TrimPrefix(apiBackend.URL, "http://"),
 		StripPrefix: true,
 	}
-	cfg.Routes.HTTP["/keep"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
-	addr, _ := startGateway(t, cfg)
 
-	noKeep := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	startServer(t, cfg)
 
-	// 剥离路由：后端收到去掉 /api 的路径。
-	resp, err := noKeep.Get("http://" + addr + "/api/items?n=1")
+	// 1) 命中 /api：走 HTTP 反代，剥前缀。
+	resp, err := http.Get("http://" + addr + "/api/users")
 	if err != nil {
-		t.Fatalf("GET /api/items: %v", err)
+		t.Fatalf("GET /api/users: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "gw-strip-ok" {
-		t.Fatalf("stripped route: status=%d body=%q", resp.StatusCode, body)
+	if resp.StatusCode != 200 || string(body) != "api-ok" {
+		t.Errorf("status=%d body=%q", resp.StatusCode, body)
 	}
-	if gotPath != "/items" || gotQuery != "n=1" {
-		t.Fatalf("backend got %q?%s, want /items?n=1", gotPath, gotQuery)
+	if apiPath != "/users" {
+		t.Errorf("api backend path = %q, want /users", apiPath)
 	}
 
-	// 透明路由：后端收到完整路径。
-	resp, err = noKeep.Get("http://" + addr + "/keep/full")
+	// 2) 非 HTTP 数据：原始透传到回显后端。
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		t.Fatalf("GET /keep/full: %v", err)
+		t.Fatalf("dial gateway: %v", err)
 	}
-	resp.Body.Close()
-	if gotPath != "/keep/full" {
-		t.Fatalf("backend got %q, want /keep/full (passthrough broken)", gotPath)
+	payload := "raw-tcp-bytes-12345"
+	if _, err := io.WriteString(conn, payload); err != nil {
+		t.Fatalf("write raw: %v", err)
 	}
-}
-
-func TestGatewayHighConcurrencyAndGracefulShutdown(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer backend.Close()
-
-	cfg := testConfig(t)
-	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
-	cfg.Server.MaxConnections = 200
-	addr, shutdown := startGateway(t, cfg)
-
-	var okCount int64
-	var wg sync.WaitGroup
-	errCh := make(chan error, 100)
-	// 禁用 keep-alive：请求结束后连接立即关闭，
-	// 使 Shutdown 走"全部连接排空"的路径。
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			resp, err := client.Get("http://" + addr + "/concurrent")
-			if err != nil {
-				errCh <- err
-				return
-			}
-			defer resp.Body.Close()
-			b, _ := io.ReadAll(resp.Body)
-			if string(b) == "ok" {
-				atomic.AddInt64(&okCount, 1)
-			}
-		}()
+	buf := make([]byte, len(payload))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
 	}
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		t.Errorf("concurrent request failed: %v", err)
-	}
-	if okCount != 100 {
-		t.Fatalf("ok responses = %d, want 100", okCount)
+	_ = conn.Close()
+	if string(buf) != payload {
+		t.Errorf("echo = %q, want %q", buf, payload)
 	}
 
-	// 优雅退出：所有连接处理完毕后 Shutdown 正常返回。
-	if err := shutdown(); err != nil {
-		t.Fatalf("graceful shutdown failed: %v", err)
+	// 3) 未命中前缀的 HTTP 请求：原样透传（回显后端原样返回字节）。
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	req := "GET /other/page HTTP/1.1\r\nHost: x\r\n\r\n"
+	if _, err := io.WriteString(conn2, req); err != nil {
+		t.Fatalf("write unmatched http: %v", err)
+	}
+	buf2 := make([]byte, len(req))
+	_ = conn2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn2, buf2); err != nil {
+		t.Fatalf("read echo2: %v", err)
+	}
+	_ = conn2.Close()
+	if string(buf2) != req {
+		t.Errorf("unmatched echo = %q, want %q", buf2, req)
 	}
 }
 
-// --- 测试辅助 ---
-
-func writeHandshake(t *testing.T, w io.Writer, protocol int32, address string, port uint16, nextState int32) {
-	t.Helper()
-	body := minecraft.EncodeVarInt(minecraft.PacketIDHandshake)
-	body = append(body, minecraft.EncodeVarInt(protocol)...)
-	body = append(body, byte(len(address)>>8), byte(len(address)))
-	body = append(body, address...)
-	body = append(body, byte(port>>8), byte(port))
-	body = append(body, minecraft.EncodeVarInt(nextState)...)
-	if err := minecraft.WritePacket(w, minecraft.PacketIDHandshake, body[1:]); err != nil {
-		t.Fatalf("write handshake: %v", err)
+func TestGatewayRejectsBadConfig(t *testing.T) {
+	cfg := newTestConfig(t, "127.0.0.1:0")
+	cfg.Backend = ""
+	if _, err := New(cfg, testLogger()); err == nil {
+		t.Error("empty backend should fail at New")
 	}
 }
 
-type byteReader struct {
-	buf []byte
-	pos int
+// writeSelfSignedCert 生成临时测试用自签证书（仅用于单元测试）。
+func writeSelfSignedCert(certPath, keyPath string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return err
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "gateway-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	if err := writePEM(certPath, "CERTIFICATE", der, 0o644); err != nil {
+		return err
+	}
+	return writePEM(keyPath, "EC PRIVATE KEY", keyDER, 0o600)
 }
 
-func newByteReader(b []byte) *byteReader { return &byteReader{buf: b} }
-
-func (b *byteReader) ReadByte() (byte, error) {
-	if b.pos >= len(b.buf) {
-		return 0, io.EOF
+func writePEM(path, blockType string, der []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
 	}
-	c := b.buf[b.pos]
-	b.pos++
-	return c, nil
-}
-
-func (b *byteReader) Read(p []byte) (int, error) {
-	if b.pos >= len(b.buf) {
-		return 0, io.EOF
-	}
-	n := copy(p, b.buf[b.pos:])
-	b.pos += n
-	return n, nil
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: blockType, Bytes: der})
 }

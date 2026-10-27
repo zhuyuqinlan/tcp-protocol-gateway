@@ -1,43 +1,29 @@
 server:
-  listen: "0.0.0.0:25565"
-  max_connections: 1000
-  handshake_timeout: 5s
-  idle_timeout: 60s
+  listen: "0.0.0.0:32920"
+  read_header_timeout: 10s
+  # 同时配置 tls_cert 与 tls_key 即启用 HTTPS（TLS 在本网关终止）。
+  # tls_cert: "cert.pem"
+  # tls_key: "key.pem"
 
 http:
   connect_timeout: 5s
+  # HTTPS 后端为自签名证书时设为 true（跳过证书校验，仅建议测试环境）。
+  tls_skip_verify: false
 
-# 多路由映射表。
+# 默认后端 TCP 地址：连接未命中任何 HTTP 前缀路由时，
+# 整条连接原始透传到该地址。
+backend: "mc.lanternwaves.fun:25565"
+
+# HTTP 路径前缀路由：连接首行是 HTTP 请求且路径命中前缀时走
+# HTTP 反代，其余连接全部透传到 backend。
 routes:
-  # HTTP 路径前缀 -> 后端（仅主端口，最长前缀优先）。
-  # 未匹配任何前缀的请求会按真实 Minecraft 服务器的行为处理
-  # （按 MC 协议解析，非法数据直接断开）。
-  #
-  # 条目支持两种写法：
-  #   "/path": "127.0.0.1:8080"     # 简写：透明转发，前缀保留
-  #   "/path":                      # 完整：可配置剥掉前缀
-  #     backend: "127.0.0.1:8080"
-  #     strip_prefix: true         # /path/x → 后端收到 /x
   http:
-    "/files":
-      backend: "127.0.0.1:8080"
+    "/zhuyuqinlan-files":
+      backend: "127.0.0.1:8000"
       strip_prefix: true
-
-  # 独立监听端口的原始 TCP 字节转发。
-  # tcp:
-  #   "0.0.0.0:30000": "127.0.0.1:9000"
-
-  # 独立监听端口的 UDP 数据报转发（会话空闲超过 server.idle_timeout 回收）。
-  # udp:
-  #   "0.0.0.0:5353": "8.8.8.8:53"
-
-minecraft:
-  enabled: true
-  version_name: "1.20.1"
-  protocol_version: 763
-  motd: "Go TCP Protocol Gateway"
-  max_players: 100
-  online_players: 0
+    "/zhuyuqinlan-blog":
+      backend: "127.0.0.1:8812"
+      strip_prefix: true
 
 logging:
   level: "info"

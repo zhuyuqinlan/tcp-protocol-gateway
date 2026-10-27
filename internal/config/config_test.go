@@ -12,26 +12,23 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(\"\"): %v", err)
 	}
-	if cfg.Server.Listen != "0.0.0.0:25565" {
+	if cfg.Server.Listen != "0.0.0.0:8000" {
 		t.Errorf("listen = %q", cfg.Server.Listen)
 	}
-	if cfg.Server.MaxConnections != 1000 {
-		t.Errorf("max_connections = %d", cfg.Server.MaxConnections)
+	if cfg.Server.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("read_header_timeout = %v", cfg.Server.ReadHeaderTimeout)
 	}
-	if cfg.Server.HandshakeTimeout != 5*time.Second {
-		t.Errorf("handshake_timeout = %v", cfg.Server.HandshakeTimeout)
+	if cfg.Server.TLSEnabled() {
+		t.Error("tls should be disabled by default")
 	}
-	if cfg.Server.IdleTimeout != 60*time.Second {
-		t.Errorf("idle_timeout = %v", cfg.Server.IdleTimeout)
+	if cfg.HTTP.ConnectTimeout != 5*time.Second {
+		t.Errorf("connect_timeout = %v", cfg.HTTP.ConnectTimeout)
 	}
-	if len(cfg.Routes.HTTP) != 0 || len(cfg.Routes.TCP) != 0 || len(cfg.Routes.UDP) != 0 {
+	if cfg.Backend != "127.0.0.1:8080" {
+		t.Errorf("backend = %q", cfg.Backend)
+	}
+	if len(cfg.Routes.HTTP) != 0 {
 		t.Errorf("default routes should be empty, got %+v", cfg.Routes)
-	}
-	if !cfg.Minecraft.Enabled {
-		t.Error("minecraft should be enabled by default")
-	}
-	if cfg.Minecraft.ProtocolVersion != 763 {
-		t.Errorf("protocol_version = %d", cfg.Minecraft.ProtocolVersion)
 	}
 }
 
@@ -40,12 +37,14 @@ func TestLoadFromFile(t *testing.T) {
 # 网关配置示例
 server:
   listen: "0.0.0.0:30000"  # 监听地址
-  max_connections: 42
-  handshake_timeout: 3s
-  idle_timeout: 30s
+  read_header_timeout: 3s
+  tls_cert: "cert.pem"
+  tls_key: "key.pem"
 
 http:
   connect_timeout: 2s
+
+backend: "127.0.0.1:9000"
 
 routes:
   http:
@@ -54,18 +53,6 @@ routes:
     "/static":
       backend: "127.0.0.1:9092"
       strip_prefix: true
-  tcp:
-    "0.0.0.0:30001": "127.0.0.1:9000"
-  udp:
-    "0.0.0.0:30002": "127.0.0.1:9050"
-
-minecraft:
-  enabled: false
-  version_name: "1.21.4"
-  protocol_version: 769
-  motd: "测试 MOTD # 带井号"
-  max_players: 20
-  online_players: 3
 
 logging:
   level: "debug"
@@ -83,17 +70,20 @@ logging:
 	if cfg.Server.Listen != "0.0.0.0:30000" {
 		t.Errorf("listen = %q", cfg.Server.Listen)
 	}
-	if cfg.Server.MaxConnections != 42 {
-		t.Errorf("max_connections = %d", cfg.Server.MaxConnections)
+	if cfg.Server.ReadHeaderTimeout != 3*time.Second {
+		t.Errorf("read_header_timeout = %v", cfg.Server.ReadHeaderTimeout)
 	}
-	if cfg.Server.HandshakeTimeout != 3*time.Second {
-		t.Errorf("handshake_timeout = %v", cfg.Server.HandshakeTimeout)
+	if !cfg.Server.TLSEnabled() {
+		t.Error("tls should be enabled")
 	}
-	if cfg.Server.IdleTimeout != 30*time.Second {
-		t.Errorf("idle_timeout = %v", cfg.Server.IdleTimeout)
+	if cfg.Server.TLSCertFile != "cert.pem" || cfg.Server.TLSKeyFile != "key.pem" {
+		t.Errorf("tls files = %q / %q", cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
 	}
 	if cfg.HTTP.ConnectTimeout != 2*time.Second {
 		t.Errorf("connect_timeout = %v", cfg.HTTP.ConnectTimeout)
+	}
+	if cfg.Backend != "127.0.0.1:9000" {
+		t.Errorf("backend = %q", cfg.Backend)
 	}
 	if cfg.Routes.HTTP["/api"] != (HTTPRoute{Backend: "127.0.0.1:9090"}) {
 		t.Errorf("routes.http[/api] = %+v", cfg.Routes.HTTP["/api"])
@@ -103,28 +93,6 @@ logging:
 	}
 	if cfg.Routes.HTTP["/static"] != (HTTPRoute{Backend: "127.0.0.1:9092", StripPrefix: true}) {
 		t.Errorf("routes.http[/static] = %+v", cfg.Routes.HTTP["/static"])
-	}
-	if cfg.Routes.TCP["0.0.0.0:30001"] != "127.0.0.1:9000" {
-		t.Errorf("routes.tcp = %q", cfg.Routes.TCP)
-	}
-	if cfg.Routes.UDP["0.0.0.0:30002"] != "127.0.0.1:9050" {
-		t.Errorf("routes.udp = %q", cfg.Routes.UDP)
-	}
-	if cfg.Minecraft.Enabled {
-		t.Error("enabled should be false")
-	}
-	if cfg.Minecraft.VersionName != "1.21.4" {
-		t.Errorf("version_name = %q", cfg.Minecraft.VersionName)
-	}
-	if cfg.Minecraft.ProtocolVersion != 769 {
-		t.Errorf("protocol_version = %d", cfg.Minecraft.ProtocolVersion)
-	}
-	// 行内注释与引号内的 '#' 都要正确处理。
-	if cfg.Minecraft.MOTD != "测试 MOTD # 带井号" {
-		t.Errorf("motd = %q", cfg.Minecraft.MOTD)
-	}
-	if cfg.Minecraft.MaxPlayers != 20 || cfg.Minecraft.OnlinePlayers != 3 {
-		t.Errorf("players = %d/%d", cfg.Minecraft.OnlinePlayers, cfg.Minecraft.MaxPlayers)
 	}
 	if cfg.Logging.Level != "debug" {
 		t.Errorf("level = %q", cfg.Logging.Level)
@@ -149,11 +117,11 @@ server:
 		t.Errorf("listen = %q", cfg.Server.Listen)
 	}
 	// 未覆盖的字段保持默认值。
-	if cfg.Server.MaxConnections != 1000 {
-		t.Errorf("max_connections = %d, want default 1000", cfg.Server.MaxConnections)
+	if cfg.Backend != "127.0.0.1:8080" {
+		t.Errorf("backend = %q, want default", cfg.Backend)
 	}
-	if cfg.Server.HandshakeTimeout != 5*time.Second {
-		t.Errorf("handshake_timeout = %v, want default", cfg.Server.HandshakeTimeout)
+	if cfg.Server.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("read_header_timeout = %v, want default", cfg.Server.ReadHeaderTimeout)
 	}
 }
 
@@ -168,15 +136,14 @@ func TestLoadInvalidValues(t *testing.T) {
 		name    string
 		content string
 	}{
-		{"bad int", "server:\n  max_connections: abc\n"},
-		{"bad duration", "server:\n  handshake_timeout: five\n"},
-		{"bad bool", "minecraft:\n  enabled: yes-please\n"},
+		{"bad duration", "server:\n  read_header_timeout: five\n"},
 		{"bad level", "logging:\n  level: verbose\n"},
-		{"zero max conn", "server:\n  max_connections: 0\n"},
+		{"empty listen", "server:\n  listen: \"\"\n"},
+		{"empty backend", "backend: \"\"\n"},
+		{"tls cert without key", "server:\n  tls_cert: \"cert.pem\"\n"},
+		{"tls key without cert", "server:\n  tls_key: \"key.pem\"\n"},
 		{"http prefix without slash", "routes:\n  http:\n    \"api\": \"1.2.3.4:80\"\n"},
 		{"empty http backend", "routes:\n  http:\n    \"/api\": \"\"\n"},
-		{"empty tcp backend", "routes:\n  tcp:\n    \"0.0.0.0:1\": \"\"\n"},
-		{"empty udp backend", "routes:\n  udp:\n    \"0.0.0.0:2\": \"\"\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -208,25 +175,5 @@ func TestParseYAMLStructure(t *testing.T) {
 	}
 	if root["d"] != "3" {
 		t.Errorf("d = %v", root["d"])
-	}
-}
-
-func TestParseYAMLQuotedKeysWithColon(t *testing.T) {
-	// 含冒号的引号键（如监听地址、IP:端口）必须正确解析。
-	root, err := parseYAML([]byte(
-		"routes:\n  tcp:\n    \"0.0.0.0:30000\": \"127.0.0.1:9000\"\n"))
-	if err != nil {
-		t.Fatalf("parseYAML: %v", err)
-	}
-	routes, ok := root["routes"].(map[string]any)
-	if !ok {
-		t.Fatalf("routes should be a map, got %T", root["routes"])
-	}
-	tcp, ok := routes["tcp"].(map[string]any)
-	if !ok {
-		t.Fatalf("routes.tcp should be a map, got %T", routes["tcp"])
-	}
-	if tcp["0.0.0.0:30000"] != "127.0.0.1:9000" {
-		t.Fatalf("routes.tcp = %v", tcp)
 	}
 }
