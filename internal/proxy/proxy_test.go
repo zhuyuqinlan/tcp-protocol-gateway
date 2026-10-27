@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"log/slog"
 	"net"
@@ -81,11 +82,11 @@ func TestProxyEndToEndHTTP(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := New(backend.Listener.Addr().String(), 2*time.Second, slog.Default())
+	p := New(2*time.Second, slog.Default())
 	client, server := tcpPair(t)
 
 	br := sniffedReader(t, client, server, nil)
-	go func() { _ = p.Handle(server, br) }()
+	go func() { _ = p.Handle(server, br, &Match{Backend: backend.Listener.Addr().String()}) }()
 
 	// POST 请求，含请求体，验证方法/路径/头/体都原样到达后端。
 	// 使用 HTTP/1.0 让后端响应后主动关闭连接，读取到 EOF 即完成。
@@ -125,13 +126,13 @@ func TestProxyGetRequest(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := New(backend.Listener.Addr().String(), 2*time.Second, slog.Default())
+	p := New(2*time.Second, slog.Default())
 	client, server := tcpPair(t)
 	br := sniffedReader(t, client, server, []byte("GET /sn"))
 
 	// 已嗅探的 "GET /sn" 在缓冲区中，其余部分随后发送。
 	go func() {
-		_ = p.Handle(server, br)
+		_ = p.Handle(server, br, &Match{Backend: backend.Listener.Addr().String()})
 		_ = server.Close()
 	}()
 
@@ -172,9 +173,11 @@ func TestProxyRequestBodyIntegrity(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := New(backend.Listener.Addr().String(), 2*time.Second, slog.Default())
+	p := New(2*time.Second, slog.Default())
 	client, server := tcpPair(t)
-	go func() { _ = p.Handle(server, sniffedReader(t, client, server, nil)) }()
+	go func() {
+		_ = p.Handle(server, sniffedReader(t, client, server, nil), &Match{Backend: backend.Listener.Addr().String()})
+	}()
 
 	go func() {
 		_, _ = client.Write([]byte("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: " +
@@ -210,12 +213,12 @@ func TestProxySniffedBytesForwardedInOrder(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := New(backend.Listener.Addr().String(), 2*time.Second, slog.Default())
+	p := New(2*time.Second, slog.Default())
 	client, server := tcpPair(t)
 
 	// 缓冲区中已有 "GET /sn"，其余 "iffed HTTP/1.0\r\n\r\n" 稍后到达。
 	br := sniffedReader(t, client, server, []byte("GET /sn"))
-	go func() { _ = p.Handle(server, br) }()
+	go func() { _ = p.Handle(server, br, &Match{Backend: backend.Listener.Addr().String()}) }()
 
 	go func() {
 		time.Sleep(20 * time.Millisecond)
@@ -234,12 +237,12 @@ func TestProxySniffedBytesForwardedInOrder(t *testing.T) {
 
 func TestProxyBackendUnavailable502(t *testing.T) {
 	// 端口 1 (tcpmux) 在测试环境几乎必然拒绝连接。
-	p := New("127.0.0.1:1", 500*time.Millisecond, slog.Default())
+	p := New(500*time.Millisecond, slog.Default())
 	client, server := tcpPair(t)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- p.Handle(server, sniffedReader(t, client, server, nil))
+		done <- p.Handle(server, sniffedReader(t, client, server, nil), &Match{Backend: "127.0.0.1:1"})
 	}()
 
 	_, err := client.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
@@ -259,6 +262,171 @@ func TestProxyBackendUnavailable502(t *testing.T) {
 	if err := <-done; err == nil {
 		t.Fatal("expected BackendUnreachable error")
 	}
+}
+
+func TestRouterLongestPrefixMatch(t *testing.T) {
+	router, err := NewRouter([]Route{
+		{Prefix: "/api", Backend: "backend-a:1"},
+		{Prefix: "/api/v1", Backend: "backend-b:2"},
+		{Prefix: "/web", Backend: "backend-c:3"},
+		{Prefix: "/api/v12", Backend: "backend-d:4"},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+
+	cases := []struct {
+		requestLine string
+		wantBackend string
+	}{
+		{"GET /api/users HTTP/1.1", "backend-a:1"},
+		{"GET /api/v1/items HTTP/1.1", "backend-b:2"}, // 最长前缀优先
+		{"GET /api/v12/x HTTP/1.1", "backend-d:4"},    // 多前缀同源，长优先
+		{"GET /web/index.html HTTP/1.1", "backend-c:3"},
+		{"GET /api?q=1 HTTP/1.1", "backend-a:1"}, // 含查询串
+		{"POST /other HTTP/1.1", ""},             // 未匹配
+		// "/apiweb" 字面上以 "/api" 开头：按纯前缀语义命中 /api。
+		// 这是刻意记录的行为——如需路径段边界匹配应在配置时规避。
+		{"GET /apiweb HTTP/1.1", "backend-a:1"},
+	}
+
+	for _, c := range cases {
+		br := bufio.NewReader(bytes.NewReader([]byte(c.requestLine + "\r\nHost: x\r\n\r\n")))
+		got, err := router.Match(br)
+		if err != nil {
+			t.Fatalf("Match(%q): %v", c.requestLine, err)
+		}
+		if c.wantBackend == "" && got != nil {
+			t.Errorf("Match(%q) = %+v, want nil", c.requestLine, got)
+		}
+		if c.wantBackend != "" && (got == nil || got.Backend != c.wantBackend) {
+			t.Errorf("Match(%q) = %+v, want backend %q", c.requestLine, got, c.wantBackend)
+		}
+	}
+}
+
+func TestRouterNoMatch(t *testing.T) {
+	router, err := NewRouter([]Route{
+		{Prefix: "/api", Backend: "backend-a:1"},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	// 请求行不完整（无换行）→ 请求行错误。
+	br := bufio.NewReader(bytes.NewReader([]byte("GET /x HTTP/1.1")))
+	if _, err := router.Match(br); err == nil {
+		t.Fatal("expected error for incomplete request line")
+	}
+	// 空路由表 → 永远未命中。
+	empty, err := NewRouter(nil)
+	if err != nil {
+		t.Fatalf("NewRouter(nil): %v", err)
+	}
+	br = bufio.NewReader(bytes.NewReader([]byte("GET / HTTP/1.1\r\n\r\n")))
+	got, err := empty.Match(br)
+	if err != nil || got != nil {
+		t.Fatalf("empty router Match = %+v, %v", got, err)
+	}
+	// 非法前缀。
+	if _, err := NewRouter([]Route{
+		{Prefix: "api", Backend: "b:1"},
+	}); err == nil {
+		t.Fatal("expected error for prefix without leading slash")
+	}
+}
+
+func TestRewriteRequestLine(t *testing.T) {
+	cases := []struct {
+		name  string
+		line  string
+		strip string
+		want  string
+		ok    bool
+	}{
+		{"normal", "GET /api/users HTTP/1.1\r\n", "/api", "GET /users HTTP/1.1\r\n", true},
+		{"query preserved", "GET /api/search?q=1&x=2 HTTP/1.1\r\n", "/api", "GET /search?q=1&x=2 HTTP/1.1\r\n", true},
+		{"empty path becomes slash", "POST /api HTTP/1.0\r\n", "/api", "POST / HTTP/1.0\r\n", true},
+		{"non-boundary gets slash", "GET /apiweb HTTP/1.1\r\n", "/api", "GET /web HTTP/1.1\r\n", true},
+		{"root prefix", "GET /users HTTP/1.1\r\n", "/", "GET /users HTTP/1.1\r\n", true},
+		{"deep prefix", "GET /api/v1/items HTTP/1.1\r\n", "/api/v1", "GET /items HTTP/1.1\r\n", true},
+		{"prefix missing passthrough", "GET /other HTTP/1.1\r\n", "/api", "", false},
+		{"malformed line", "GARBAGE\r\n", "/api", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := rewriteRequestLine([]byte(c.line), c.strip)
+			if ok != c.ok {
+				t.Fatalf("ok = %v, want %v (got %q)", ok, c.ok, got)
+			}
+			if ok && string(got) != c.want {
+				t.Fatalf("rewritten = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestProxyStripPrefixForward(t *testing.T) {
+	var gotPath, gotRaw string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRaw = r.URL.RawQuery
+		_, _ = w.Write([]byte("strip-ok"))
+	}))
+	defer backend.Close()
+
+	p := New(2*time.Second, slog.Default())
+
+	t.Run("prefix stripped", func(t *testing.T) {
+		client, server := tcpPair(t)
+		br := sniffedReader(t, client, server, []byte("GET /api/us"))
+		go func() { _ = p.Handle(server, br, &Match{Backend: backend.Listener.Addr().String(), Strip: "/api"}) }()
+		// "ers HTTP/1.0\r\n\r\n" 分片稍后到达，验证拼接与重写共存。
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			_, _ = client.Write([]byte("ers HTTP/1.0\r\nHost: x\r\n\r\n"))
+		}()
+
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, _ := io.ReadAll(client)
+		if !strings.Contains(string(resp), "strip-ok") {
+			t.Fatalf("unexpected response %q", resp)
+		}
+		if gotPath != "/users" {
+			t.Fatalf("backend got path %q, want /users (prefix not stripped?)", gotPath)
+		}
+	})
+
+	t.Run("empty remainder becomes slash", func(t *testing.T) {
+		client, server := tcpPair(t)
+		go func() {
+			_ = p.Handle(server, sniffedReader(t, client, server, nil),
+				&Match{Backend: backend.Listener.Addr().String(), Strip: "/api"})
+		}()
+		if _, err := client.Write([]byte("GET /api HTTP/1.0\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, _ := io.ReadAll(client)
+		if !strings.Contains(string(resp), "strip-ok") || gotPath != "/" {
+			t.Fatalf("backend got path %q resp %q, want / with response", gotPath, resp)
+		}
+	})
+
+	t.Run("query string survives strip", func(t *testing.T) {
+		client, server := tcpPair(t)
+		go func() {
+			_ = p.Handle(server, sniffedReader(t, client, server, nil),
+				&Match{Backend: backend.Listener.Addr().String(), Strip: "/api"})
+		}()
+		if _, err := client.Write([]byte("GET /api/search?q=hello HTTP/1.0\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, _ := io.ReadAll(client)
+		if !strings.Contains(string(resp), "strip-ok") || gotPath != "/search" || gotRaw != "q=hello" {
+			t.Fatalf("backend got path %q query %q, want /search?q=hello", gotPath, gotRaw)
+		}
+	})
 }
 
 func TestProxyHalfClose(t *testing.T) {
@@ -290,9 +458,11 @@ func TestProxyHalfClose(t *testing.T) {
 		backendDone <- buf[:n]
 	}()
 
-	p := New(ln.Addr().String(), 2*time.Second, slog.Default())
+	p := New(2*time.Second, slog.Default())
 	client, server := tcpPair(t)
-	go func() { _ = p.Handle(server, sniffedReader(t, client, server, nil)) }()
+	go func() {
+		_ = p.Handle(server, sniffedReader(t, client, server, nil), &Match{Backend: ln.Addr().String()})
+	}()
 
 	_, _ = client.Write([]byte("PING"))
 	_ = client.(*net.TCPConn).CloseWrite()
@@ -349,9 +519,11 @@ func TestProxyWebSocketUpgradePassthrough(t *testing.T) {
 		}
 	}()
 
-	p := New(ln.Addr().String(), 2*time.Second, slog.Default())
+	p := New(2*time.Second, slog.Default())
 	client, server := tcpPair(t)
-	go func() { _ = p.Handle(server, sniffedReader(t, client, server, nil)) }()
+	go func() {
+		_ = p.Handle(server, sniffedReader(t, client, server, nil), &Match{Backend: ln.Addr().String()})
+	}()
 
 	req := "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"

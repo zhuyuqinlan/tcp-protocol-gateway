@@ -67,7 +67,25 @@ func parseYAML(data []byte) (map[string]any, error) {
 }
 
 // splitKeyValue 拆分 "key: value" 或 "key:"。
+// 键可以是双引号包裹的形式（如 "0.0.0.0:30000"），
+// 此定位以闭合引号为界，键内的冒号不影响解析。
 func splitKeyValue(body string, lineNo int) (key, value string, err error) {
+	if strings.HasPrefix(body, `"`) {
+		end := strings.Index(body[1:], `"`)
+		if end < 0 {
+			return "", "", fmt.Errorf("line %d: unterminated quoted key", lineNo)
+		}
+		key = body[1 : 1+end]
+		if key == "" {
+			return "", "", fmt.Errorf("line %d: empty key", lineNo)
+		}
+		rest := body[1+end+1:]
+		if !strings.HasPrefix(rest, ":") {
+			return "", "", fmt.Errorf("line %d: expected ':' after quoted key", lineNo)
+		}
+		return key, rest[1:], nil
+	}
+
 	idx := strings.Index(body, ":")
 	if idx < 0 {
 		return "", "", fmt.Errorf("line %d: expected \"key: value\", got %q", lineNo, body)
@@ -75,10 +93,6 @@ func splitKeyValue(body string, lineNo int) (key, value string, err error) {
 	key = strings.TrimSpace(body[:idx])
 	if key == "" {
 		return "", "", fmt.Errorf("line %d: empty key", lineNo)
-	}
-	// 支持双引号包裹的 key，例如 "my:key": v —— 本项目用不到，但保持健壮。
-	if quoted, ok := tryUnquote(key); ok {
-		key = quoted
 	}
 	return key, body[idx+1:], nil
 }

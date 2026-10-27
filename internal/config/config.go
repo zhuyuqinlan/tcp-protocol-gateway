@@ -21,10 +21,44 @@ type ServerConfig struct {
 	IdleTimeout      time.Duration `yaml:"idle_timeout"`
 }
 
-// HTTPConfig HTTP 透明代理配置。
+// HTTPConfig HTTP 代理全局配置。
 type HTTPConfig struct {
-	Backend        string        `yaml:"backend"`
 	ConnectTimeout time.Duration `yaml:"connect_timeout"`
+}
+
+// HTTPRoute 是一条 HTTP 路径前缀路由。
+type HTTPRoute struct {
+	// Backend 是该前缀命中的请求转发目标。
+	Backend string `yaml:"backend"`
+	// StripPrefix 为 true 时，转发前把命中的前缀从请求行
+	// 的 request-target 中剥掉（如 /api/users → /users；
+	// 剥完为空时转发为 /）。false 表示透明转发（保留前缀）。
+	StripPrefix bool `yaml:"strip_prefix"`
+}
+
+// RoutesConfig 多路由映射表。
+//
+// 配置形式（键为前缀/监听地址）：
+//
+//	routes:
+//	  http:                          # 路径前缀 -> HTTP 后端（最长前缀优先）
+//	    "/api": "127.0.0.1:8080"     # 简写：仅后端，保留前缀
+//	    "/web":                      # 完整形式：可配置前缀剥离
+//	      backend: "127.0.0.1:8081"
+//	      strip_prefix: true
+//	  tcp:                       # 监听地址 -> TCP 后端（原始字节转发）
+//	    "0.0.0.0:30000": "127.0.0.1:9000"
+//	  udp:                       # 监听地址 -> UDP 后端（数据报转发）
+//	    "0.0.0.0:5353": "8.8.8.8:53"
+type RoutesConfig struct {
+	// HTTP 是路径前缀到后端的映射，仅作用于主监听端口。
+	HTTP map[string]HTTPRoute `yaml:"http"`
+	// TCP 是监听地址到后端的映射，每个条目独立监听一个 TCP 端口，
+	// 将连接的字节流原样转发到后端。
+	TCP map[string]string `yaml:"tcp"`
+	// UDP 是监听地址到后端的映射，每个条目独立监听一个 UDP 端口，
+	// 按客户端地址维持会话转发数据报。
+	UDP map[string]string `yaml:"udp"`
 }
 
 // MinecraftConfig Minecraft SLP 模拟配置。
@@ -46,6 +80,7 @@ type LoggingConfig struct {
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	HTTP      HTTPConfig      `yaml:"http"`
+	Routes    RoutesConfig    `yaml:"routes"`
 	Minecraft MinecraftConfig `yaml:"minecraft"`
 	Logging   LoggingConfig   `yaml:"logging"`
 }
@@ -61,8 +96,12 @@ func Defaults() *Config {
 			IdleTimeout:      60 * time.Second,
 		},
 		HTTP: HTTPConfig{
-			Backend:        "127.0.0.1:8080",
 			ConnectTimeout: 5 * time.Second,
+		},
+		Routes: RoutesConfig{
+			HTTP: map[string]HTTPRoute{},
+			TCP:  map[string]string{},
+			UDP:  map[string]string{},
 		},
 		Minecraft: MinecraftConfig{
 			Enabled:         true,
@@ -112,12 +151,21 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := applySection(root, "http", func(m map[string]any) error {
-		if err := decodeString(m, "backend", &cfg.HTTP.Backend); err != nil {
-			return err
-		}
 		return decodeDuration(m, "connect_timeout", &cfg.HTTP.ConnectTimeout)
 	}); err != nil {
 		return nil, fmt.Errorf("section http: %w", err)
+	}
+
+	if err := applySection(root, "routes", func(m map[string]any) error {
+		if err := decodeHTTPRoutes(m, "http", cfg.Routes.HTTP); err != nil {
+			return err
+		}
+		if err := decodeStringMap(m, "tcp", cfg.Routes.TCP); err != nil {
+			return err
+		}
+		return decodeStringMap(m, "udp", cfg.Routes.UDP)
+	}); err != nil {
+		return nil, fmt.Errorf("section routes: %w", err)
 	}
 
 	if err := applySection(root, "minecraft", func(m map[string]any) error {
@@ -167,11 +215,32 @@ func (c *Config) validate() error {
 	if c.Server.IdleTimeout <= 0 {
 		return fmt.Errorf("server.idle_timeout must be > 0")
 	}
-	if c.HTTP.Backend == "" {
-		return fmt.Errorf("http.backend must not be empty")
-	}
 	if c.HTTP.ConnectTimeout <= 0 {
 		return fmt.Errorf("http.connect_timeout must be > 0")
+	}
+	for prefix, route := range c.Routes.HTTP {
+		if !strings.HasPrefix(prefix, "/") {
+			return fmt.Errorf("routes.http prefix %q must start with '/'", prefix)
+		}
+		if route.Backend == "" {
+			return fmt.Errorf("routes.http[%s]: backend must not be empty", prefix)
+		}
+	}
+	for listen, backend := range c.Routes.TCP {
+		if listen == "" {
+			return fmt.Errorf("routes.tcp listen must not be empty")
+		}
+		if backend == "" {
+			return fmt.Errorf("routes.tcp[%s]: backend must not be empty", listen)
+		}
+	}
+	for listen, backend := range c.Routes.UDP {
+		if listen == "" {
+			return fmt.Errorf("routes.udp listen must not be empty")
+		}
+		if backend == "" {
+			return fmt.Errorf("routes.udp[%s]: backend must not be empty", listen)
+		}
 	}
 	switch strings.ToLower(c.Logging.Level) {
 	case "debug", "info", "warn", "error":
@@ -204,6 +273,72 @@ func decodeString(m map[string]any, key string, dst *string) error {
 		return fmt.Errorf("field %s: expected string, got %T", key, v)
 	}
 	*dst = s
+	return nil
+}
+
+// decodeStringMap 将 m[key]（"key: value" 形式的映射）解码到 dst，
+// 仅保留字符串值。
+func decodeStringMap(m map[string]any, key string, dst map[string]string) error {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	sub, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf("field %s: expected a mapping", key)
+	}
+	for k, sv := range sub {
+		if sv == nil {
+			continue
+		}
+		s, ok := sv.(string)
+		if !ok {
+			return fmt.Errorf("field %s.%s: expected string value, got %T", key, k, sv)
+		}
+		dst[k] = s
+	}
+	return nil
+}
+
+// decodeHTTPRoutes 将 m[key] 解码为 HTTP 路由表。条目值支持两种形式：
+//
+//	"/api": "127.0.0.1:8080"        # 简写：仅后端地址，保留前缀
+//	"/web":                         # 完整形式
+//	  backend: "127.0.0.1:8081"
+//	  strip_prefix: true
+func decodeHTTPRoutes(m map[string]any, key string, dst map[string]HTTPRoute) error {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	sub, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf("field %s: expected a mapping", key)
+	}
+	for prefix, sv := range sub {
+		if sv == nil {
+			continue
+		}
+		switch val := sv.(type) {
+		case string:
+			dst[prefix] = HTTPRoute{Backend: val}
+		case map[string]any:
+			var r HTTPRoute
+			if err := decodeString(val, "backend", &r.Backend); err != nil {
+				return fmt.Errorf("field %s.%s: %w", key, prefix, err)
+			}
+			if raw, present := val["strip_prefix"]; present && raw != nil {
+				b, err := parseBool(raw)
+				if err != nil {
+					return fmt.Errorf("field %s.%s.strip_prefix: %w", key, prefix, err)
+				}
+				r.StripPrefix = b
+			}
+			dst[prefix] = r
+		default:
+			return fmt.Errorf("field %s.%s: expected backend string or mapping, got %T", key, prefix, sv)
+		}
+	}
 	return nil
 }
 

@@ -6,7 +6,7 @@
 
 | 协议 | 行为 |
 | --- | --- |
-| HTTP/1.x（GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/CONNECT） | 透明 TCP 转发到配置的后端（默认 `127.0.0.1:8080`） |
+| HTTP/1.x（GET/POST/PUT/DELETE/HEAD/OPTIONS/PATCH/CONNECT） | 按路径前缀路由表透明 TCP 转发到对应后端；未命中前缀按 Minecraft 真实行为处理 |
 | Minecraft Java Edition 握手（Next State = 1） | 本地模拟 SLP：返回 Status JSON、响应 Ping/Pong |
 | Minecraft Java Edition 握手（Next State = 2） | 返回 Disconnect 消息，拒绝登录 |
 | TLS ClientHello | 明确拒绝（网关不解密 TLS） |
@@ -44,14 +44,37 @@ go test ./...
 
 ```yaml
 server:
-  listen: "0.0.0.0:25565"       # 监听地址
-  max_connections: 1000          # 最大并发连接数
+  listen: "0.0.0.0:25565"       # 主监听地址（协议嗅探端口）
+  max_connections: 1000          # 最大并发连接数（全部端口共享预算）
   handshake_timeout: 5s          # 协议嗅探阶段读取期限
-  idle_timeout: 60s              # Minecraft 会话空闲超时
+  idle_timeout: 60s              # Minecraft 会话空闲超时 / UDP 会话空闲回收时间
 
 http:
-  backend: "127.0.0.1:8080"      # HTTP 后端（固定，客户端不可指定）
-  connect_timeout: 5s            # 连接后端超时
+  connect_timeout: 5s            # 连接后端超时（HTTP/TCP 路由共用）
+
+# 多路由映射表
+routes:
+  # HTTP 路径前缀 -> 后端（仅主端口，最长前缀优先）。
+  # 未匹配任何前缀的请求按真实 Minecraft 服务器的行为处理
+  # （见下文"未匹配请求的 Minecraft 模拟"）。
+  #
+  # 条目支持两种写法：
+  #   简写（字符串值）：透明转发，前缀保留；
+  #   完整（映射值）：可配置 strip_prefix，转发前剥掉命中的前缀。
+  http:
+    "/api":
+      backend: "127.0.0.1:8080"
+      strip_prefix: true          # /api/users → 后端收到 /users；
+                                  # 请求正好是 /api 时转发为 /
+    "/web": "127.0.0.1:8081"      # 透明转发，后端收到 /web/... 完整路径
+
+  # 独立监听端口的原始 TCP 字节转发（不嗅探协议）。
+  tcp:
+    "0.0.0.0:30000": "127.0.0.1:9000"
+
+  # 独立监听端口的 UDP 数据报转发（按客户端地址维持会话）。
+  udp:
+    "0.0.0.0:5353": "8.8.8.8:53"
 
 minecraft:
   enabled: true                  # 是否响应 Minecraft SLP
@@ -65,7 +88,15 @@ logging:
   level: "info"                  # debug / info / warn / error
 ```
 
-说明：配置解析器支持嵌套映射、双引号字符串、`#` 行注释，不支持列表/锚点/多行字符串等完整 YAML 语法。`go.sum` 不存在是因为项目零第三方依赖。
+### 路由语义
+
+- **HTTP 路由**：作用于主监听端口，按请求行路径前缀匹配（含查询串），**最长前缀优先**。例：配置 `"/api"` 与 `"/api/v1"` 时，`/api/v1/x` 命中后者。
+- **未匹配请求的 Minecraft 模拟**：主端口上未匹配任何 HTTP 前缀的请求**不会返回 404**，而是与真实 Minecraft 服务器的表现一致——字节被当作 Minecraft 协议解析：凑巧是合法 SLP/Login 包则得到协议响应；无法解析（HTTP 请求必然如此）则像原版服务器收到无效包一样直接断开连接。整个主端口对外行为与一台真实的 Minecraft 服务器无法区分。
+- **TCP 路由**：每个条目独立监听一个 TCP 端口，连接建立后双向原样转发字节流（半关闭语义与 HTTP 代理一致），不解析任何协议。
+- **UDP 路由**：每个条目独立监听一个 UDP 端口，按客户端地址维持"客户端 ↔ 后端"会话双向转发数据报；会话空闲超过 `server.idle_timeout` 自动回收。
+- 所有端口的连接共享 `server.max_connections` 预算；路由前缀/目标均来自配置文件，客户端不可指定，无开放代理风险。
+
+说明：配置解析器支持嵌套映射、双引号键值（如 `"0.0.0.0:30000"`）、`#` 行注释，不支持列表/锚点/多行字符串等完整 YAML 语法。`go.sum` 不存在是因为项目零第三方依赖。
 
 ## 构建
 
@@ -129,15 +160,18 @@ journalctl -u tcp-protocol-gateway -f   # 查看日志
 ### HTTP 转发
 
 ```bash
-# 先准备一个后端（例如）
+# 先准备一个后端（例如，对应 routes.http 里的 "/api"）
 python3 -m http.server 8080
 
-# 通过网关访问
-curl -v http://127.0.0.1:25565/
-curl -X POST -d 'hello' http://127.0.0.1:25565/api
+# 命中前缀的请求被转发到后端
+curl -v http://127.0.0.1:25565/api/
+curl -X POST -d 'hello' http://127.0.0.1:25565/api/submit
 
-# 后端不可用时应返回 502
-curl -i http://127.0.0.1:25565/
+# 未命中任何前缀：无 HTTP 响应，连接被按 Minecraft 服务器行为断开
+curl -v --max-time 5 http://127.0.0.1:25565/other
+
+# 后端不可用时返回 502
+curl -i http://127.0.0.1:25565/api/
 ```
 
 ### Minecraft SLP
@@ -205,7 +239,7 @@ go test -race ./...      # 竞态检测（需要 CGO 与 C 编译器）
 go vet ./...
 ```
 
-测试覆盖：HTTP GET/POST 转发、TCP 分片重组、请求体完整性、Handshake 解析、Status 响应、Ping/Pong、Login 拒绝、无效 VarInt 与异常包长、未知协议与嗅探超时、100 并发连接与优雅退出。
+测试覆盖：HTTP GET/POST 转发、TCP 分片重组、请求体完整性、多路由前缀分流（最长前缀优先）、未匹配请求的 Minecraft 模拟（连接断开且不触碰后端）、TCP 路由字节转发、UDP 路由会话转发与空闲回收、Handshake 解析、Status 响应、Ping/Pong、Login 拒绝、无效 VarInt 与异常包长、未知协议与嗅探超时、100 并发连接与优雅退出。
 
 ## 设计要点
 
@@ -223,7 +257,15 @@ go vet ./...
 
 ### 与开放代理的区别
 
-HTTP 后端地址仅来自配置文件，客户端无法通过请求行、Host 头或任何内容指定转发目标，因此不存在开放代理风险。网关不解析、不修改 HTTP 内容。
+HTTP 后端地址与路径前缀仅来自配置文件，客户端无法通过请求行、Host 头或任何内容指定转发目标，因此不存在开放代理风险。网关不解析、不修改 HTTP 内容。
+
+### 路径前缀路由与 Minecraft 模拟的语义边界
+
+- HTTP 前缀匹配基于请求行（request-target），判定发生在连接建立时的第一个请求上。网关是透明 TCP 代理，Keep-Alive 长连接一旦建立就是纯字节隧道，**后续请求不再经过网关**——前缀路由只约束每个 TCP 连接的第一个请求（同一连接上的后续请求由客户端与后端自行协商）。如需严格逐请求路由，请让客户端使用短连接（`Connection: close`）或在后端再做一次路径校验。
+- `strip_prefix: true` 只重写连接的**第一个请求行**：剥掉命中的前缀后转发（`/api/users` → `/users`；剥完为空转发为 `/`；剥完不以 `/` 开头则补 `/`）。查询串原样保留。同理，Keep-Alive 连接上的后续请求不会被重写。
+- 前缀匹配是纯字符串语义：`/apiweb` 会命中 `/api`（剥离后为 `/web`）。需要路径段边界时请配置更精确的前缀（如 `/api/`）。
+- 前缀匹配是纯字符串前缀语义：`/apiweb` 会命中前缀 `/api`。需要路径段边界时，请使用带尾斜杠的更精确前缀（如 `/api/`）。
+- HTTP 路由全部未命中时进入 Minecraft 模拟路径（见上文），不再返回 404。
 
 ## 项目结构
 
@@ -233,8 +275,9 @@ tcp-protocol-gateway/
 ├── internal/
 │   ├── config/                  # 配置结构与内置 YAML 子集解析器
 │   ├── detector/                # 协议嗅探（Peek、歧义消除）
-│   ├── gateway/                 # TCP 服务：监听、并发控制、分发、优雅退出
-│   ├── proxy/                   # HTTP 透明 TCP 代理
+│   ├── gateway/                 # 监听编排：主端口嗅探分发 + TCP/UDP 路由、优雅退出
+│   ├── proxy/                   # HTTP 前缀路由器 + TCP 透明转发
+│   ├── relay/                   # UDP 数据报中继（会话管理、空闲回收）
 │   └── minecraft/               # VarInt/String 编解码、Handshake、SLP 状态机
 ├── deploy/                      # systemd 服务文件
 ├── config.yaml
@@ -248,8 +291,9 @@ tcp-protocol-gateway/
 | 现象 | 可能原因 / 处理 |
 | --- | --- |
 | 启动报 `bind: address already in use` | 25565 被占用：`ss -ltnp \| grep 25565` 找到占用进程，或修改 `server.listen` |
-| HTTP 请求返回 502 | 后端 `127.0.0.1:8080` 未启动或不可达；检查 `http.backend` 与后端服务 |
+| HTTP 请求返回 502 | 命中的路由后端未启动或不可达；检查 `routes.http` 中该前缀对应的后端服务 |
 | Minecraft 客户端显示"无法连接" | 确认 `minecraft.enabled: true`；用 `logging.level: debug` 观察握手日志 |
+| TCP/UDP 路由端口不通 | 确认 `routes.tcp`/`routes.udp` 的监听端口已开放（防火墙/安全组），后端地址可达 |
 | 客户端刚连上就被断开 | 握手数据 5 秒内未发全（慢连接超时）；或协议嗅探失败（日志有 `unknown protocol`） |
 | Linux 上 `bind: permission denied` | 端口 < 1024 需要 `CAP_NET_BIND_SERVICE` 或改用高端口 |
 | 大量连接被拒 | 触达 `max_connections` 上限，调大该值或排查上游连接泄漏 |

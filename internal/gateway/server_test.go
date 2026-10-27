@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -27,7 +28,8 @@ func testConfig(t *testing.T) *config.Config {
 	cfg.Server.Listen = "127.0.0.1:0"
 	cfg.Server.HandshakeTimeout = 500 * time.Millisecond
 	cfg.Server.IdleTimeout = 2 * time.Second
-	cfg.HTTP.Backend = "127.0.0.1:1" // 由各测试按需覆盖
+	// 由各测试按需配置 HTTP 路由；此处默认无路由（未匹配即 Minecraft 模拟）。
+	_ = cfg
 	return cfg
 }
 
@@ -89,7 +91,7 @@ func TestGatewayHTTPGetForwarded(t *testing.T) {
 	defer backend.Close()
 
 	cfg := testConfig(t)
-	cfg.HTTP.Backend = backend.Listener.Addr().String()
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
 	addr, _ := startGateway(t, cfg)
 
 	resp, err := http.Get("http://" + addr + "/test")
@@ -115,7 +117,7 @@ func TestGatewayHTTPPostForwarded(t *testing.T) {
 	defer backend.Close()
 
 	cfg := testConfig(t)
-	cfg.HTTP.Backend = backend.Listener.Addr().String()
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
 	addr, _ := startGateway(t, cfg)
 
 	resp, err := http.Post("http://"+addr+"/submit",
@@ -143,7 +145,7 @@ func TestGatewayHTTPFragmentedHeader(t *testing.T) {
 	defer backend.Close()
 
 	cfg := testConfig(t)
-	cfg.HTTP.Backend = backend.Listener.Addr().String()
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
 	addr, _ := startGateway(t, cfg)
 
 	conn, err := net.Dial("tcp", addr)
@@ -199,7 +201,7 @@ func TestGatewayHTTPBodyIntegrity(t *testing.T) {
 	defer backend.Close()
 
 	cfg := testConfig(t)
-	cfg.HTTP.Backend = backend.Listener.Addr().String()
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
 	addr, _ := startGateway(t, cfg)
 
 	req, _ := http.NewRequest(http.MethodPut, "http://"+addr+"/upload", strings.NewReader(""))
@@ -437,9 +439,249 @@ func TestGatewayTLSRejected(t *testing.T) {
 	}
 }
 
+func TestGatewayHTTPMultiRoute(t *testing.T) {
+	// 两个 HTTP 路由：/api 与 /web 分流到不同后端；
+	// 未匹配任何前缀的请求按真实 Minecraft 服务器行为处理。
+	pathA := make(chan string, 4)
+	pathB := make(chan string, 4)
+	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathA <- r.URL.Path
+		_, _ = w.Write([]byte("from-a"))
+	}))
+	defer backendA.Close()
+	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathB <- r.URL.Path
+		_, _ = w.Write([]byte("from-b"))
+	}))
+	defer backendB.Close()
+
+	cfg := testConfig(t)
+	cfg.Routes.HTTP["/api"] = config.HTTPRoute{Backend: backendA.Listener.Addr().String()}
+	cfg.Routes.HTTP["/web"] = config.HTTPRoute{Backend: backendB.Listener.Addr().String()}
+	addr, _ := startGateway(t, cfg)
+
+	noKeep := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
+	// /api -> 后端 A。
+	resp, err := noKeep.Get("http://" + addr + "/api/items")
+	if err != nil {
+		t.Fatalf("GET /api/items: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "from-a" {
+		t.Fatalf("/api request: status=%d body=%q", resp.StatusCode, body)
+	}
+	if p := <-pathA; p != "/api/items" {
+		t.Fatalf("backend A got path %q", p)
+	}
+
+	// /web -> 后端 B。
+	resp, err = noKeep.Get("http://" + addr + "/web/index.html")
+	if err != nil {
+		t.Fatalf("GET /web/index.html: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "from-b" {
+		t.Fatalf("/web request: status=%d body=%q", resp.StatusCode, body)
+	}
+	if p := <-pathB; p != "/web/index.html" {
+		t.Fatalf("backend B got path %q", p)
+	}
+
+	// 未匹配任何前缀：模拟真实 Minecraft 服务器——不返回任何
+	// HTTP 响应，连接被直接断开（原版服务器对无法解析的包
+	// 正是如此处理），后端 A/B 均不应收到请求。
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte("GET /nomatch HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 256)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("expected connection close (minecraft simulation) for unmatched request")
+	}
+	select {
+	case p := <-pathA:
+		t.Fatalf("unmatched request reached backend A: %q", p)
+	case p := <-pathB:
+		t.Fatalf("unmatched request reached backend B: %q", p)
+	default:
+	}
+}
+
+func TestGatewayUnmatchedHTTPSimulatesMinecraft(t *testing.T) {
+	// 无任何 HTTP 路由时，主端口对外的行为应与真实 Minecraft
+	// 服务器一致：HTTP 请求被当作无效 MC 包，连接直接断开；
+	// 而合法的 SLP 请求仍得到正常的 Status/Pong 响应。
+	cfg := testConfig(t)
+	addr, _ := startGateway(t, cfg)
+
+	// 1) HTTP 请求 → 无响应，连接断开。
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+	buf := make([]byte, 256)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("expected close for HTTP request on route-less gateway")
+	}
+	conn.Close()
+
+	// 2) 合法 SLP → Status 正常返回（模拟真实服务器）。
+	conn2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn2.Close()
+	_ = conn2.SetDeadline(time.Now().Add(3 * time.Second))
+	writeHandshake(t, conn2, 763, "mc.example.com", 25565, minecraft.NextStateStatus)
+	if err := minecraft.WritePacket(conn2, minecraft.PacketIDStatusRequest, nil); err != nil {
+		t.Fatalf("write status request: %v", err)
+	}
+	id, payload, err := minecraft.ReadPacket(bufio.NewReader(conn2), 65536)
+	if err != nil {
+		t.Fatalf("read status response: %v", err)
+	}
+	if id != minecraft.PacketIDStatusResponse {
+		t.Fatalf("packet id = %d", id)
+	}
+	if !strings.Contains(string(payload), "Go TCP Protocol Gateway") {
+		t.Fatalf("unexpected status payload %q", payload)
+	}
+}
+
+func TestGatewayTCPRoutes(t *testing.T) {
+	// 独立端口的原始 TCP 字节转发：双向回显验证。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			bc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c) // 回显
+			}(bc)
+		}
+	}()
+
+	// 分配 TCP 路由监听端口。
+	tmp, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("alloc port: %v", err)
+	}
+	routeAddr := tmp.Addr().String()
+	_ = tmp.Close()
+
+	cfg := testConfig(t)
+	cfg.Routes.TCP[routeAddr] = ln.Addr().String()
+	startGateway(t, cfg)
+
+	conn, err := net.Dial("tcp", routeAddr)
+	if err != nil {
+		t.Fatalf("dial tcp route: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	// 发送任意二进制（非 HTTP/MC），应原样回显——证明是纯字节转发。
+	payload := []byte{0x00, 0xFF, 0x10, 'r', 'a', 'w', 0x80, 0x01}
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("echo mismatch: got %x want %x", got, payload)
+	}
+}
+
+func TestGatewayUDPRoutes(t *testing.T) {
+	// 独立端口的 UDP 数据报转发：与后端 UDP 回显服务互发。
+	backendPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendPC.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := backendPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			// 回显并附带标记。
+			resp := append([]byte("udp-echo:"), buf[:n]...)
+			_, _ = backendPC.WriteTo(resp, addr)
+		}
+	}()
+
+	// 分配 UDP 路由监听端口。
+	tmp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("alloc port: %v", err)
+	}
+	routeAddr := tmp.LocalAddr().String()
+	_ = tmp.Close()
+
+	cfg := testConfig(t)
+	cfg.Server.IdleTimeout = 2 * time.Second
+	cfg.Routes.UDP[routeAddr] = backendPC.LocalAddr().String()
+	_, _ = startGateway(t, cfg)
+
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("client listen: %v", err)
+	}
+	defer clientPC.Close()
+	_ = clientPC.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// 等待中继完成 socket 绑定，避免首个数据报发往未监听端口被丢弃。
+	time.Sleep(100 * time.Millisecond)
+
+	// 发送两个数据报（验证会话复用）。
+	for i := 0; i < 2; i++ {
+		msg := []byte(fmt.Sprintf("ping-%d", i))
+		if _, err := clientPC.WriteTo(msg, mustUDPAddr(t, routeAddr)); err != nil {
+			t.Fatalf("write datagram: %v", err)
+		}
+		buf := make([]byte, 2048)
+		n, _, err := clientPC.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("read datagram %d: %v", i, err)
+		}
+		if string(buf[:n]) != fmt.Sprintf("udp-echo:ping-%d", i) {
+			t.Fatalf("datagram %d echo = %q", i, buf[:n])
+		}
+	}
+}
+
+func mustUDPAddr(t *testing.T, addr string) net.Addr {
+	t.Helper()
+	a, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", addr, err)
+	}
+	return a
+}
+
 func TestGatewayBackendDown502(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.HTTP.Backend = "127.0.0.1:1" // 不可达
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: "127.0.0.1:1"} // 不可达
 	addr, _ := startGateway(t, cfg)
 
 	resp, err := http.Get("http://" + addr + "/x")
@@ -452,6 +694,50 @@ func TestGatewayBackendDown502(t *testing.T) {
 	}
 }
 
+func TestGatewayHTTPStripPrefix(t *testing.T) {
+	var gotPath, gotQuery string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		_, _ = w.Write([]byte("gw-strip-ok"))
+	}))
+	defer backend.Close()
+
+	cfg := testConfig(t)
+	// "/api" 剥前缀；"/keep" 透明转发（同一后端便于对比）。
+	cfg.Routes.HTTP["/api"] = config.HTTPRoute{
+		Backend:     backend.Listener.Addr().String(),
+		StripPrefix: true,
+	}
+	cfg.Routes.HTTP["/keep"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
+	addr, _ := startGateway(t, cfg)
+
+	noKeep := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
+	// 剥离路由：后端收到去掉 /api 的路径。
+	resp, err := noKeep.Get("http://" + addr + "/api/items?n=1")
+	if err != nil {
+		t.Fatalf("GET /api/items: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "gw-strip-ok" {
+		t.Fatalf("stripped route: status=%d body=%q", resp.StatusCode, body)
+	}
+	if gotPath != "/items" || gotQuery != "n=1" {
+		t.Fatalf("backend got %q?%s, want /items?n=1", gotPath, gotQuery)
+	}
+
+	// 透明路由：后端收到完整路径。
+	resp, err = noKeep.Get("http://" + addr + "/keep/full")
+	if err != nil {
+		t.Fatalf("GET /keep/full: %v", err)
+	}
+	resp.Body.Close()
+	if gotPath != "/keep/full" {
+		t.Fatalf("backend got %q, want /keep/full (passthrough broken)", gotPath)
+	}
+}
+
 func TestGatewayHighConcurrencyAndGracefulShutdown(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
@@ -459,7 +745,7 @@ func TestGatewayHighConcurrencyAndGracefulShutdown(t *testing.T) {
 	defer backend.Close()
 
 	cfg := testConfig(t)
-	cfg.HTTP.Backend = backend.Listener.Addr().String()
+	cfg.Routes.HTTP["/"] = config.HTTPRoute{Backend: backend.Listener.Addr().String()}
 	cfg.Server.MaxConnections = 200
 	addr, shutdown := startGateway(t, cfg)
 

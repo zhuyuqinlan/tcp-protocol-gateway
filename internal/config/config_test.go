@@ -24,8 +24,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Server.IdleTimeout != 60*time.Second {
 		t.Errorf("idle_timeout = %v", cfg.Server.IdleTimeout)
 	}
-	if cfg.HTTP.Backend != "127.0.0.1:8080" {
-		t.Errorf("backend = %q", cfg.HTTP.Backend)
+	if len(cfg.Routes.HTTP) != 0 || len(cfg.Routes.TCP) != 0 || len(cfg.Routes.UDP) != 0 {
+		t.Errorf("default routes should be empty, got %+v", cfg.Routes)
 	}
 	if !cfg.Minecraft.Enabled {
 		t.Error("minecraft should be enabled by default")
@@ -45,8 +45,19 @@ server:
   idle_timeout: 30s
 
 http:
-  backend: "127.0.0.1:9090"
   connect_timeout: 2s
+
+routes:
+  http:
+    "/api": "127.0.0.1:9090"
+    "/web": "127.0.0.1:9091"
+    "/static":
+      backend: "127.0.0.1:9092"
+      strip_prefix: true
+  tcp:
+    "0.0.0.0:30001": "127.0.0.1:9000"
+  udp:
+    "0.0.0.0:30002": "127.0.0.1:9050"
 
 minecraft:
   enabled: false
@@ -81,11 +92,23 @@ logging:
 	if cfg.Server.IdleTimeout != 30*time.Second {
 		t.Errorf("idle_timeout = %v", cfg.Server.IdleTimeout)
 	}
-	if cfg.HTTP.Backend != "127.0.0.1:9090" {
-		t.Errorf("backend = %q", cfg.HTTP.Backend)
-	}
 	if cfg.HTTP.ConnectTimeout != 2*time.Second {
 		t.Errorf("connect_timeout = %v", cfg.HTTP.ConnectTimeout)
+	}
+	if cfg.Routes.HTTP["/api"] != (HTTPRoute{Backend: "127.0.0.1:9090"}) {
+		t.Errorf("routes.http[/api] = %+v", cfg.Routes.HTTP["/api"])
+	}
+	if cfg.Routes.HTTP["/web"] != (HTTPRoute{Backend: "127.0.0.1:9091"}) {
+		t.Errorf("routes.http[/web] = %+v", cfg.Routes.HTTP["/web"])
+	}
+	if cfg.Routes.HTTP["/static"] != (HTTPRoute{Backend: "127.0.0.1:9092", StripPrefix: true}) {
+		t.Errorf("routes.http[/static] = %+v", cfg.Routes.HTTP["/static"])
+	}
+	if cfg.Routes.TCP["0.0.0.0:30001"] != "127.0.0.1:9000" {
+		t.Errorf("routes.tcp = %q", cfg.Routes.TCP)
+	}
+	if cfg.Routes.UDP["0.0.0.0:30002"] != "127.0.0.1:9050" {
+		t.Errorf("routes.udp = %q", cfg.Routes.UDP)
 	}
 	if cfg.Minecraft.Enabled {
 		t.Error("enabled should be false")
@@ -129,8 +152,8 @@ server:
 	if cfg.Server.MaxConnections != 1000 {
 		t.Errorf("max_connections = %d, want default 1000", cfg.Server.MaxConnections)
 	}
-	if cfg.HTTP.Backend != "127.0.0.1:8080" {
-		t.Errorf("backend = %q, want default", cfg.HTTP.Backend)
+	if cfg.Server.HandshakeTimeout != 5*time.Second {
+		t.Errorf("handshake_timeout = %v, want default", cfg.Server.HandshakeTimeout)
 	}
 }
 
@@ -150,6 +173,10 @@ func TestLoadInvalidValues(t *testing.T) {
 		{"bad bool", "minecraft:\n  enabled: yes-please\n"},
 		{"bad level", "logging:\n  level: verbose\n"},
 		{"zero max conn", "server:\n  max_connections: 0\n"},
+		{"http prefix without slash", "routes:\n  http:\n    \"api\": \"1.2.3.4:80\"\n"},
+		{"empty http backend", "routes:\n  http:\n    \"/api\": \"\"\n"},
+		{"empty tcp backend", "routes:\n  tcp:\n    \"0.0.0.0:1\": \"\"\n"},
+		{"empty udp backend", "routes:\n  udp:\n    \"0.0.0.0:2\": \"\"\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -181,5 +208,25 @@ func TestParseYAMLStructure(t *testing.T) {
 	}
 	if root["d"] != "3" {
 		t.Errorf("d = %v", root["d"])
+	}
+}
+
+func TestParseYAMLQuotedKeysWithColon(t *testing.T) {
+	// 含冒号的引号键（如监听地址、IP:端口）必须正确解析。
+	root, err := parseYAML([]byte(
+		"routes:\n  tcp:\n    \"0.0.0.0:30000\": \"127.0.0.1:9000\"\n"))
+	if err != nil {
+		t.Fatalf("parseYAML: %v", err)
+	}
+	routes, ok := root["routes"].(map[string]any)
+	if !ok {
+		t.Fatalf("routes should be a map, got %T", root["routes"])
+	}
+	tcp, ok := routes["tcp"].(map[string]any)
+	if !ok {
+		t.Fatalf("routes.tcp should be a map, got %T", routes["tcp"])
+	}
+	if tcp["0.0.0.0:30000"] != "127.0.0.1:9000" {
+		t.Fatalf("routes.tcp = %v", tcp)
 	}
 }

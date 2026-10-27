@@ -5,8 +5,31 @@ server:
   idle_timeout: 60s
 
 http:
-  backend: "127.0.0.1:8080"
   connect_timeout: 5s
+
+# 多路由映射表。
+routes:
+  # HTTP 路径前缀 -> 后端（仅主端口，最长前缀优先）。
+  # 未匹配任何前缀的请求会按真实 Minecraft 服务器的行为处理
+  # （按 MC 协议解析，非法数据直接断开）。
+  #
+  # 条目支持两种写法：
+  #   "/path": "127.0.0.1:8080"     # 简写：透明转发，前缀保留
+  #   "/path":                      # 完整：可配置剥掉前缀
+  #     backend: "127.0.0.1:8080"
+  #     strip_prefix: true         # /path/x → 后端收到 /x
+  http:
+    "/files":
+      backend: "127.0.0.1:8080"
+      strip_prefix: true
+
+  # 独立监听端口的原始 TCP 字节转发。
+  # tcp:
+  #   "0.0.0.0:30000": "127.0.0.1:9000"
+
+  # 独立监听端口的 UDP 数据报转发（会话空闲超过 server.idle_timeout 回收）。
+  # udp:
+  #   "0.0.0.0:5353": "8.8.8.8:53"
 
 minecraft:
   enabled: true
