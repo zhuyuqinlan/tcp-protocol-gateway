@@ -1,0 +1,35 @@
+[Unit]
+Description=TCP Multi-Protocol Gateway
+Documentation=file:/usr/local/share/doc/tcp-protocol-gateway/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+ExecStart=/usr/local/bin/tcp-protocol-gateway -config /etc/tcp-protocol-gateway/config.yaml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+# 安全加固：单二进制网关不需要任何特权与文件系统写入。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# 日志交给 journald（journalctl -u tcp-protocol-gateway）。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tcp-protocol-gateway
+
+[Install]
+WantedBy=multi-user.target
