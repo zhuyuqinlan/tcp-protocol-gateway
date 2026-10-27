@@ -1,0 +1,20 @@
+server:
+  listen: "0.0.0.0:25565"
+  max_connections: 1000
+  handshake_timeout: 5s
+  idle_timeout: 60s
+
+http:
+  backend: "127.0.0.1:8080"
+  connect_timeout: 5s
+
+minecraft:
+  enabled: true
+  version_name: "1.20.1"
+  protocol_version: 763
+  motd: "Go TCP Protocol Gateway"
+  max_players: 100
+  online_players: 0
+
+logging:
+  level: "info"
