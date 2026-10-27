@@ -1,0 +1,38 @@
+# 默认：文本文件，由 Git 自动规范化
+* text=auto
+
+# --- Go 源码与工程文件：强制 LF（跨平台构建一致性） ---
+*.go        text diff=golang
+go.mod      text
+go.sum      text
+Makefile    text eol=lf
+*.mk        text eol=lf
+
+# --- 配置与文档：LF ---
+*.yaml      text
+*.yml       text
+*.json      text
+*.md        text
+*.txt       text
+
+# --- systemd / shell 脚本：LF（部署到 Linux，CRLF 会导致解析失败） ---
+*.service   text eol=lf
+*.sh        text eol=lf
+
+# --- Windows 专属：CRLF ---
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# --- Windows 注册表导出等（如有） ---
+*.reg       text eol=crlf
+
+# --- 二进制文件：不做任何转换 ---
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.pdf       binary

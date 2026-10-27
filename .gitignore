@@ -1,0 +1,34 @@
+# --- 编译产物 ---
+/tcp-protocol-gateway
+/tcp-protocol-gateway.exe
+*.exe
+*.test
+*.out
+*.prof
+dist/
+
+# --- Go 工具链 ---
+/vendor/
+*.cover
+coverage.txt
+coverage.html
+
+# --- 本地调试 / 冒烟测试残留 ---
+.smoke/
+*.log
+
+# --- 本地配置（含真实后端地址/端口，按环境差异不入库） ---
+config.local.yaml
+*.local.yaml
+
+# --- 编辑器 / IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini
